@@ -63,7 +63,7 @@ def _seed(run_path: Path, entry_count: int) -> tuple[str, Path]:
             "snapshot",
             PLAN_SCHEMA_VERSION,
             "draft",
-            "benchmark-output",
+            "/tmp/benchmark-output",
             "now",
         ),
     )
@@ -225,6 +225,7 @@ def run_case(entry_count: int, scenario: str, repetitions: int) -> dict[str, obj
                 "affected_baseline_rows_read": int(result["affected_entry_count"]),
                 "sqlite_rows_read": metrics["sqlite_rows_read"],
                 "sqlite_rows_written": metrics["sqlite_rows_written"],
+                "sqlite_statements": metrics["sqlite_statements"],
                 "sqlite_vm_steps_lower_bound": metrics["sqlite_vm_steps_lower_bound"],
                 "database_growth_bytes": database_growth,
                 "total_entries": int(result["total_entry_count"]),

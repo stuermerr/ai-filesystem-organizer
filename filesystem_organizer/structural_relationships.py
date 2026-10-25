@@ -26,6 +26,16 @@ _STRUCTURAL_BATCH_MAX_ROWS = 500
 _STRUCTURAL_BATCH_MAX_BYTES = 64 * 1024 * 1024
 _STRUCTURAL_BATCH_MAX_PAYLOAD_BYTES = _STRUCTURAL_BATCH_MAX_BYTES - 1024 * 1024
 CANONICAL_REASON_RANKING = "shallowest relative path, then lexical relative-path order"
+STRUCTURAL_ROW_CALIBRATION_BYTES = 1000
+
+
+@dataclass(frozen=True)
+class StructuralMetadata:
+    relative_path: str
+    entry_kind: str
+    read_outcome: str
+    observed_byte_size: int | None
+    is_empty: bool | None
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,83 @@ class Relationship:
     canonical_reason: str
     qualifications: tuple[str, ...]
     unverified_counterparts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StructuralEvidenceProjection:
+    row_count: int
+    indexed_text_bytes: int
+    estimated_storage_bytes: int
+
+
+def _ancestor_evidence_paths(path: str, roots: set[str]) -> list[tuple[str, str]]:
+    parts = path.split("/")
+    evidence_paths: list[tuple[str, str]] = []
+    for length in range(len(parts)):
+        root = "." if length == 0 else "/".join(parts[:length])
+        if root in roots:
+            evidence_paths.append((root, "/".join(parts[length:])))
+    return evidence_paths
+
+
+def project_structural_evidence(
+    entries: Sequence[StructuralMetadata], *, run_id_bytes: int = 36
+) -> StructuralEvidenceProjection:
+    """Project exact tree-index rows and estimate their schema/index storage.
+
+    Row count and UTF-8 text sizes use the same successful-directory ancestor
+    semantics as persistence. Storage is deliberately an estimate: it combines
+    the schema's repeated table/PK/lookup-index text with the observed
+    1,000-byte-per-row floor from the pre-0.1.1 large-corpus failure.
+    """
+    roots = {
+        entry.relative_path
+        for entry in entries
+        if entry.entry_kind == "directory"
+        and entry.read_outcome == READ_OUTCOME_SUCCESSFUL
+    }
+    row_count = 0
+    indexed_text_bytes = 0
+    for entry in entries:
+        path = entry.relative_path
+        kind = entry.entry_kind
+        outcome = entry.read_outcome
+        if path == ".":
+            continue
+        if kind == "regular-file" and outcome == READ_OUTCOME_SUCCESSFUL:
+            stored_kind = "regular-file"
+            identity = (
+                f"BLAKE3-256:1:{int(entry.observed_byte_size or 0)}:" + ("0" * 64)
+            )
+        elif kind == "directory" and outcome == READ_OUTCOME_SUCCESSFUL:
+            stored_kind = "empty-directory" if bool(entry.is_empty) else "directory"
+            identity = ""
+        else:
+            stored_kind = "unprocessable"
+            identity = f"{kind}:{outcome}"
+        kind_bytes = len(stored_kind.encode("utf-8"))
+        identity_bytes = len(identity.encode("utf-8"))
+        for root, relative in _ancestor_evidence_paths(path, roots):
+            root_bytes = len(root.encode("utf-8"))
+            relative_bytes = len(relative.encode("utf-8"))
+            row_count += 1
+            # Text repeated across the table, implicit PK index, and lookup index.
+            indexed_text_bytes += (
+                (3 * run_id_bytes)
+                + (2 * root_bytes)
+                + (3 * relative_bytes)
+                + (2 * kind_bytes)
+                + (2 * identity_bytes)
+            )
+    estimated_storage_bytes = max(
+        indexed_text_bytes + (64 * row_count),
+        STRUCTURAL_ROW_CALIBRATION_BYTES * row_count,
+    )
+    return StructuralEvidenceProjection(
+        row_count=row_count,
+        indexed_text_bytes=indexed_text_bytes,
+        estimated_storage_bytes=estimated_storage_bytes,
+    )
 
 
 class _StructuralEvidenceBatch:
@@ -205,12 +292,7 @@ def _persist_directory_tree_evidence(
             record = ("empty-directory" if bool(row[3]) else "directory", "")
         else:
             record = ("unprocessable", f"{kind}:{outcome}")
-        parts = path.split("/")
-        for length in range(len(parts)):
-            root = "." if length == 0 else "/".join(parts[:length])
-            if root not in roots:
-                continue
-            relative = "/".join(parts[length:])
+        for root, relative in _ancestor_evidence_paths(path, roots):
             records_by_root[root].append((relative, *record))
 
     evidence = _StructuralEvidenceBatch(connection, "tree-index-batch")

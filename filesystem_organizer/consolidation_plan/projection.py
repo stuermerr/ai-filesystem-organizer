@@ -11,6 +11,7 @@ from ..exact_duplicate_groups import (
     derive_exact_duplicate_groups,
 )
 from .conflict_projection import component_has_conflict, project_lossless_conflicts
+from .inventory_projection import InventoryProjectionIndex
 from .models import (
     ConflictSourceMapping,
     ConsolidationPlanError,
@@ -197,6 +198,7 @@ def persist_plan_projection(
     run_id: str,
     structural_unions: list[StructuralUnion],
     conflict_groups: list[LosslessConflictProjection],
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> None:
     """Persist the selected Structural Unions as the plan's immutable meaning."""
     skipped_reasons = {
@@ -206,11 +208,22 @@ def persist_plan_projection(
             (run_id,),
         )
     }
-    unprocessable = connection.execute(
-        "SELECT relative_path, entry_kind, read_outcome FROM inventory_entries "
-        "WHERE run_id = ? AND read_outcome != ? ORDER BY relative_path",
-        (run_id, READ_OUTCOME_SUCCESSFUL),
-    ).fetchall()
+    projection_index = inventory_index or InventoryProjectionIndex.load(
+        connection, run_id
+    )
+
+    def omitted_rows(roots: tuple[str, ...]) -> list[tuple[str, str]]:
+        omitted: dict[str, str] = {}
+        for root in roots:
+            for record in projection_index.descendants(root):
+                if record.read_outcome == READ_OUTCOME_SUCCESSFUL:
+                    continue
+                omitted[record.relative_path] = skipped_reasons.get(
+                    record.relative_path,
+                    f"{record.entry_kind}: {record.read_outcome}",
+                )
+        return sorted(omitted.items())
+
     relationships = {
         (str(row["left_root"]), str(row["right_root"])): (
             str(row["qualifications"]),
@@ -222,7 +235,7 @@ def persist_plan_projection(
             (run_id,),
         )
     }
-    for index, union in enumerate(structural_unions):
+    for union_index, union in enumerate(structural_unions):
         qualifications, unverified = (
             relationships.get((union.roots[0], union.roots[1]), ("", ""))
             if len(union.roots) == 2
@@ -232,7 +245,7 @@ def persist_plan_projection(
             "INSERT INTO plan_projection_unions VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 plan_id,
-                index,
+                union_index,
                 union.canonical_root,
                 union.classification,
                 union.canonical_reason,
@@ -242,44 +255,31 @@ def persist_plan_projection(
         )
         connection.executemany(
             "INSERT INTO plan_projection_union_roots VALUES (?, ?, ?)",
-            ((plan_id, index, root) for root in union.roots),
+            ((plan_id, union_index, root) for root in union.roots),
         )
-        for row in unprocessable:
-            relative_path = str(row["relative_path"])
-            if any(
-                is_within(relative_path, root) and relative_path != root
-                for root in union.roots
-            ):
-                reason = skipped_reasons.get(
-                    relative_path, f"{row['entry_kind']}: {row['read_outcome']}"
-                )
-                connection.execute(
-                    "INSERT INTO plan_projection_omitted_entries VALUES (?, ?, ?, ?)",
-                    (plan_id, index, relative_path, reason),
-                )
-    for index, group in enumerate(conflict_groups):
+        connection.executemany(
+            "INSERT INTO plan_projection_omitted_entries VALUES (?, ?, ?, ?)",
+            (
+                (plan_id, union_index, relative_path, reason)
+                for relative_path, reason in omitted_rows(union.roots)
+            ),
+        )
+    for group_index, group in enumerate(conflict_groups):
         connection.execute(
             "INSERT INTO plan_projection_conflict_groups VALUES (?, ?, ?, ?)",
-            (plan_id, index, group.canonical_root, group.canonical_reason),
+            (plan_id, group_index, group.canonical_root, group.canonical_reason),
         )
         connection.executemany(
             "INSERT INTO plan_projection_conflict_group_roots VALUES (?, ?, ?)",
-            ((plan_id, index, root) for root in group.roots),
+            ((plan_id, group_index, root) for root in group.roots),
         )
-        for row in unprocessable:
-            relative_path = str(row["relative_path"])
-            if any(
-                is_within(relative_path, root) and relative_path != root
-                for root in group.roots
-            ):
-                reason = skipped_reasons.get(
-                    relative_path, f"{row['entry_kind']}: {row['read_outcome']}"
-                )
-                connection.execute(
-                    "INSERT INTO plan_projection_conflict_omitted_entries "
-                    "VALUES (?, ?, ?, ?)",
-                    (plan_id, index, relative_path, reason),
-                )
+        connection.executemany(
+            "INSERT INTO plan_projection_conflict_omitted_entries VALUES (?, ?, ?, ?)",
+            (
+                (plan_id, group_index, relative_path, reason)
+                for relative_path, reason in omitted_rows(group.roots)
+            ),
+        )
 
 
 def _retained_operations(
@@ -366,7 +366,9 @@ def _unrelated_roots(left: str, right: str) -> bool:
 
 
 def _structural_projections(
-    connection: sqlite3.Connection, run_id: str
+    connection: sqlite3.Connection,
+    run_id: str,
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> list[StructuralUnion | LosslessConflictProjection]:
     """Return independently validated, non-nested structural projections.
 
@@ -457,7 +459,9 @@ def _structural_projections(
             for right in ordered_roots[index + 1 :]
         ):
             continue
-        component_conflicts = component_has_conflict(connection, run_id, ordered_roots)
+        component_conflicts = component_has_conflict(
+            connection, run_id, ordered_roots, inventory_index
+        )
         if component_conflicts:
             projections.append(
                 LosslessConflictProjection(
@@ -550,6 +554,7 @@ def _structural_entries(
     connection: sqlite3.Connection,
     run_id: str,
     projections: list[StructuralUnion | LosslessConflictProjection],
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> tuple[
     list[PlanOutputEntry],
     set[str],
@@ -561,20 +566,13 @@ def _structural_entries(
     covered_files: set[str] = set()
     planned_roots: set[str] = set()
     conflict_mappings: list[tuple[int, ConflictSourceMapping]] = []
+    index = inventory_index or InventoryProjectionIndex.load(connection, run_id)
     identity_rows = {
-        str(row["relative_path"]): row
-        for row in connection.execute(
-            "SELECT relative_path, algorithm, algorithm_version, byte_size, digest "
-            "FROM content_identities WHERE run_id = ? AND read_outcome = 'successful'",
-            (run_id,),
-        )
+        row.relative_path: row
+        for row in index.records
+        if row.identity_outcome == READ_OUTCOME_SUCCESSFUL
     }
-    inventory = connection.execute(
-        "SELECT relative_path, entry_kind, read_outcome FROM inventory_entries "
-        "WHERE run_id = ? ORDER BY relative_path",
-        (run_id,),
-    ).fetchall()
-    inventory_paths = {str(row["relative_path"]) for row in inventory}
+    inventory_paths = set(index.paths)
     conflict_namespace = "__fso-conflicts__"
     suffix = 0
     while any(
@@ -595,6 +593,7 @@ def _structural_entries(
                 roots,
                 canonical,
                 conflict_namespace,
+                index,
             )
             entries.extend(result.entries)
             covered_files.update(result.covered_files)
@@ -607,18 +606,16 @@ def _structural_entries(
         projected: dict[str, list[str]] = {}
         directories: set[str] = {canonical}
         for root in roots:
-            for row in inventory:
-                source = str(row["relative_path"])
-                if not is_within(source, root) or source == root:
-                    continue
+            for row in index.descendants(root):
+                source = row.relative_path
                 relative = source[len(root) + 1 :] if root != "." else source
                 output = f"{canonical}/{relative}" if canonical != "." else relative
                 if (
-                    row["entry_kind"] == "directory"
-                    and row["read_outcome"] == READ_OUTCOME_SUCCESSFUL
+                    row.entry_kind == "directory"
+                    and row.read_outcome == READ_OUTCOME_SUCCESSFUL
                 ):
                     directories.add(output)
-                elif row["entry_kind"] == "regular-file" and source in identity_rows:
+                elif row.entry_kind == "regular-file" and source in identity_rows:
                     projected.setdefault(output, []).append(source)
                     covered_files.add(source)
         reason = (
@@ -633,15 +630,19 @@ def _structural_entries(
         for output, sources in sorted(projected.items()):
             source = min(sources)
             identity = identity_rows[source]
+            assert identity.byte_size is not None
+            assert identity.algorithm is not None
+            assert identity.algorithm_version is not None
+            assert identity.digest is not None
             entries.append(
                 PlanOutputEntry(
                     "file",
                     output,
                     source,
-                    int(identity["byte_size"]),
-                    str(identity["algorithm"]),
-                    int(identity["algorithm_version"]),
-                    str(identity["digest"]),
+                    int(identity.byte_size),
+                    str(identity.algorithm),
+                    int(identity.algorithm_version),
+                    str(identity.digest),
                     reason,
                 )
             )

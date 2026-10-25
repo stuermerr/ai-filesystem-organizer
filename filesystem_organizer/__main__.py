@@ -6,8 +6,14 @@ import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
-from .analysis_run import AnalysisRunError, create_analysis_run, resume_analysis_run
+from .analysis_run import (
+    AnalysisRunError,
+    create_analysis_run,
+    resolve_materialized_destination,
+    resume_analysis_run,
+)
 from .consolidation_plan import (
     ConsolidationPlanError,
     apply_layout,
@@ -35,6 +41,13 @@ from .materialization import (
 )
 from .progress import TqdmProgressReporter
 from .report import render_report, write_full_report
+from .scan_admission import admit_scan_environment, scan_admission_payload
+from .source_probe import (
+    SourceProbeError,
+    mount_root_preparation_payload,
+    source_probe_payload,
+)
+from .workspace_cleanup import WorkspaceCleanupError, cleanup_completed_run
 
 SUCCESS = 0
 SAFE_REFUSAL = 1
@@ -44,6 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="filesystem-organizer")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    source_probe = commands.add_parser(
+        "source-probe", help="inspect source access and effective mount facts"
+    )
+    source_probe.add_argument("selected_backup_root", type=Path)
+
+    prepare_mount = commands.add_parser(
+        "prepare-mount-root",
+        help="preview or explicitly prepare a mount root for same-drive output",
+    )
+    prepare_mount.add_argument("selected_backup_root", type=Path)
+    prepare_mount.add_argument(
+        "--yes",
+        action="store_true",
+        help="move the listed top-level entries after explicit user confirmation",
+    )
+
     scan = commands.add_parser("scan", help="create a persisted Analysis Run")
     scan.add_argument("selected_backup_root", type=Path)
     scan.add_argument(
@@ -52,6 +81,49 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.cwd() / "output",
         help="Run Output Root (default: ./output)",
     )
+    scan.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Run Workspace Root for internal state (default: Run Output Root)",
+    )
+    scan_destination = scan.add_mutually_exclusive_group()
+    scan_destination.add_argument(
+        "--destination",
+        type=Path,
+        default=None,
+        help="exact destination for metadata admission before content analysis",
+    )
+    scan_destination.add_argument(
+        "--in-place",
+        action="store_true",
+        help="admit the preferred supported in-place executor before scanning",
+    )
+
+    scan_admission = commands.add_parser(
+        "scan-admission", help="check cheap scan and destination blockers"
+    )
+    scan_admission.add_argument("selected_backup_root", type=Path)
+    scan_admission.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path.cwd() / "output",
+        help="Run Output Root (default: ./output)",
+    )
+    scan_admission.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Run Workspace Root for internal state (default: Run Output Root)",
+    )
+    scan_admission_destination = scan_admission.add_mutually_exclusive_group()
+    scan_admission_destination.add_argument(
+        "--destination",
+        type=Path,
+        default=None,
+        help="optional exact Materialized Consolidation destination to admit",
+    )
+    scan_admission_destination.add_argument("--in-place", action="store_true")
 
     report = commands.add_parser("report", help="report one explicit Analysis Run")
     report.add_argument("analysis_run", type=Path)
@@ -68,20 +140,32 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("analysis_run", type=Path)
 
     runs = commands.add_parser(
-        "runs", help="discover Analysis Runs beneath one Run Output Root"
+        "runs", help="discover Analysis Runs beneath one Run Workspace Root"
     )
     runs.add_argument(
         "run_output_root",
         type=Path,
         nargs="?",
-        default=Path.cwd() / "output",
-        help="Run Output Root (default: ./output)",
+        default=None,
+        help="legacy/default Run Output Root (default: ./output)",
+    )
+    runs.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="explicit Run Workspace Root when it differs from Run Output Root",
     )
 
     status = commands.add_parser(
         "status", help="report persisted state for one explicit Analysis Run"
     )
     status.add_argument("analysis_run", type=Path)
+
+    cleanup = commands.add_parser(
+        "cleanup-completed",
+        help="remove terminal internal state from one completed Analysis Run",
+    )
+    cleanup.add_argument("analysis_run", type=Path)
 
     plan = commands.add_parser(
         "plan", help="create a persisted draft Consolidation Plan"
@@ -193,12 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument(
         "--yes",
         action="store_true",
-        help="approve headlessly without an interactive confirmation prompt",
+        help="approve source-preserving materialization headlessly",
     )
     materialize.add_argument(
         "--acknowledge-destructive",
         action="store_true",
-        help="required with --in-place in addition to approval",
+        help="approve destructive in-place materialization headlessly",
     )
 
     materialize_preflight = commands.add_parser(
@@ -223,19 +307,83 @@ def build_parser() -> argparse.ArgumentParser:
 def main(arguments: list[str] | None = None) -> int:
     options = build_parser().parse_args(arguments)
     try:
-        if options.command == "scan":
+        if options.command == "source-probe":
+            print(
+                json.dumps(
+                    source_probe_payload(options.selected_backup_root),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        elif options.command == "prepare-mount-root":
+            print(
+                json.dumps(
+                    mount_root_preparation_payload(
+                        options.selected_backup_root, execute=options.yes
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        elif options.command == "scan-admission":
+            result = scan_admission_payload(
+                options.selected_backup_root,
+                options.output_root,
+                options.destination,
+                options.workspace_root,
+                in_place=options.in_place,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif options.command == "scan":
+            run_id = str(uuid4())
+            effective_destination = resolve_materialized_destination(
+                options.output_root, run_id, options.destination
+            )
+            admission = admit_scan_environment(
+                options.selected_backup_root,
+                options.output_root,
+                None if options.in_place else effective_destination,
+                options.workspace_root,
+                in_place=options.in_place,
+            )
             with TqdmProgressReporter() as progress:
                 result = create_analysis_run(
                     options.selected_backup_root,
                     options.output_root,
+                    workspace_root=options.workspace_root,
+                    destination=options.destination,
+                    run_id=run_id,
                     progress=progress,
+                    execution_mode=admission.execution_mode,
+                    executor_kind=admission.executor_kind,
+                    executor_version=admission.executor_version,
+                    execution_admission_version=admission.execution_admission_version,
+                    execution_admitted_at=admission.execution_admitted_at,
                 )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif options.command == "runs":
-            result = discover_analysis_runs(options.run_output_root)
+            if (
+                options.run_output_root is not None
+                and options.workspace_root is not None
+            ):
+                raise ControlPlaneError(
+                    "runs accepts either a Run Output Root or --workspace-root, not both"
+                )
+            if options.workspace_root is not None:
+                result = discover_analysis_runs(
+                    options.workspace_root, legacy_output_root=False
+                )
+            else:
+                result = discover_analysis_runs(
+                    options.run_output_root or Path.cwd() / "output",
+                    legacy_output_root=True,
+                )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif options.command == "status":
             result = inspect_analysis_run(options.analysis_run)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif options.command == "cleanup-completed":
+            result = cleanup_completed_run(options.analysis_run)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif options.command == "resume":
             with TqdmProgressReporter() as progress:
@@ -352,14 +500,6 @@ def main(arguments: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return SAFE_REFUSAL
-            if options.in_place and not options.acknowledge_destructive:
-                print(
-                    "error: in-place materialization requires a destructive acknowledgement "
-                    "(--acknowledge-destructive) "
-                    "in addition to --yes or path-specific confirmation",
-                    file=sys.stderr,
-                )
-                return SAFE_REFUSAL
             if (
                 content_empty_result(options.analysis_run, options.plan_id)
                 and not options.acknowledge_content_empty
@@ -369,21 +509,28 @@ def main(arguments: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return SAFE_REFUSAL
-            if options.yes:
+            if options.in_place and sys.stdin.isatty():
+                sys.stdout.write(render_preflight_summary(preflight))
+                response = input(
+                    "Type the Selected Backup Root exactly to confirm destructive "
+                    f"materialization: {preflight.selected_backup_root}: "
+                )
+                approved = response.strip() == preflight.selected_backup_root
+            elif options.in_place and options.acknowledge_destructive:
+                approved = True
+            elif options.in_place:
+                print(
+                    "error: headless in-place materialization requires "
+                    "--acknowledge-destructive with the exact plan identifier",
+                    file=sys.stderr,
+                )
+                return SAFE_REFUSAL
+            elif options.yes:
                 approved = True
             elif sys.stdin.isatty():
                 sys.stdout.write(render_preflight_summary(preflight))
-                prompt = (
-                    f"Type the Selected Backup Root exactly to confirm destructive materialization: {preflight.selected_backup_root}: "
-                    if options.in_place
-                    else "Type 'yes' to confirm materialization: "
-                )
-                response = input(prompt)
-                approved = (
-                    response.strip() == preflight.selected_backup_root
-                    if options.in_place
-                    else response.strip().lower() == "yes"
-                )
+                response = input("Type 'yes' to confirm materialization: ")
+                approved = response.strip().lower() == "yes"
             else:
                 print(
                     "error: headless materialization requires --yes with the "
@@ -401,7 +548,17 @@ def main(arguments: list[str] | None = None) -> int:
                     options.destination,
                     in_place=options.in_place,
                     progress=progress,
+                    admission=preflight,
                 )
+            if not options.in_place:
+                try:
+                    cleanup = cleanup_completed_run(options.analysis_run)
+                except (OSError, WorkspaceCleanupError) as error:
+                    cleanup = {
+                        "cleanup_status": "preserved",
+                        "reason": str(error),
+                    }
+                result["workspace_cleanup"] = cleanup["cleanup_status"]
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             if options.detail == "full":
@@ -430,6 +587,8 @@ def main(arguments: list[str] | None = None) -> int:
         ConsolidationPlanError,
         ControlPlaneError,
         MaterializationError,
+        SourceProbeError,
+        WorkspaceCleanupError,
         OSError,
         sqlite3.Error,
     ) as error:

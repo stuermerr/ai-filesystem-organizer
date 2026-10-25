@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
+
+from .linux_filesystem import LinuxFilesystemError, effective_filesystem_type
 
 DATABASE_NAME = "analysis.sqlite3"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 PLAN_SCHEMA_VERSION = 9
 ATTEMPT_SCHEMA_VERSION = 1
 
@@ -140,6 +146,93 @@ class RunWorkspaceError(Exception):
     """A safe, user-facing refusal of a Run Workspace operation."""
 
 
+@dataclass(frozen=True)
+class WorkspaceCapabilities:
+    root: str
+    filesystem_type: str
+    file_size_bits: int
+    maximum_file_size: int | None
+    free_bytes: int
+    writable_directory_creation: bool
+    sqlite_wal: bool
+
+
+def inspect_workspace_capabilities(path: Path) -> WorkspaceCapabilities:
+    """Inspect deterministic capacity facts for one existing workspace directory."""
+    resolved = path.resolve(strict=True)
+    try:
+        workspace_filesystem_type = effective_filesystem_type(resolved)
+        bits = int(os.pathconf(resolved, "PC_FILESIZEBITS"))
+        free_bytes = int(shutil.disk_usage(resolved).free)
+    except (LinuxFilesystemError, OSError, ValueError) as error:
+        raise RunWorkspaceError(
+            f"cannot inspect Run Workspace capacity: {resolved}"
+        ) from error
+    if bits <= 0:
+        raise RunWorkspaceError(
+            f"invalid Run Workspace file-size capability ({bits} bits): {resolved}"
+        )
+    known_maximum = (
+        (1 << 32) - 1
+        if workspace_filesystem_type.lower() in {"vfat", "msdos", "fat"}
+        else None
+    )
+    return WorkspaceCapabilities(
+        root=str(resolved),
+        filesystem_type=workspace_filesystem_type,
+        file_size_bits=bits,
+        maximum_file_size=known_maximum,
+        free_bytes=free_bytes,
+        writable_directory_creation=True,
+        sqlite_wal=True,
+    )
+
+
+def admit_workspace_root(
+    workspace_root: Path, selected_root: Path
+) -> WorkspaceCapabilities:
+    """Probe creation and SQLite WAL, then report filesystem capacity facts."""
+    resolved = workspace_root.expanduser().resolve(strict=False)
+    require_outside_selected_root(resolved, "Run Workspace Root", selected_root)
+    missing: list[Path] = []
+    candidate = resolved
+    while not candidate.exists():
+        missing.append(candidate)
+        candidate = candidate.parent
+    if not candidate.is_dir():
+        raise RunWorkspaceError(
+            f"Run Workspace Root ancestor is not a directory: {candidate}"
+        )
+    probe: Path | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        for directory in reversed(missing):
+            directory.mkdir()
+        probe = resolved / f".filesystem-organizer-workspace-{uuid4().hex}"
+        probe.mkdir()
+        connection = open_wal_read_write(probe / DATABASE_NAME)
+        connection.execute("CREATE TABLE workspace_wal_probe (value INTEGER)")
+        connection.execute("INSERT INTO workspace_wal_probe VALUES (1)")
+        connection.commit()
+        return inspect_workspace_capabilities(resolved)
+    except RunWorkspaceError:
+        raise
+    except (OSError, sqlite3.Error) as error:
+        raise RunWorkspaceError(
+            "Run Workspace Root lacks required directory creation, capacity "
+            f"inspection, or SQLite WAL capability: {resolved}"
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
+        if probe is not None and probe.is_dir():
+            for entry in probe.iterdir():
+                entry.unlink(missing_ok=True)
+            probe.rmdir()
+        for directory in missing:
+            directory.rmdir() if directory.is_dir() else None
+
+
 def resolve_run_directory(analysis_run: Path) -> tuple[Path, Path]:
     """Resolve an Analysis Run directory and its database path.
 
@@ -171,6 +264,18 @@ def require_outside_selected_root(
         )
 
 
+def nearest_existing_directory(path: Path, label: str = "Path") -> Path:
+    """Return the nearest existing directory at or above ``path``."""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            if not candidate.is_dir():
+                raise RunWorkspaceError(
+                    f"{label} ancestor is not a directory: {candidate}"
+                )
+            return candidate
+    raise RunWorkspaceError(f"{label} has no existing ancestor directory: {path}")
+
+
 def open_read_write(
     database_path: Path,
     *,
@@ -188,14 +293,15 @@ def open_read_write(
 def admit_wal(connection: sqlite3.Connection) -> None:
     """Admit the connection's database to WAL mode, refusing other modes.
 
-    The Run Output Root filesystem must support WAL journaling; any other
+    The Run Workspace Root filesystem must support WAL journaling; any other
     result is a hard refusal so the run database never silently drops to a
     weaker durability mode.
     """
     mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
     if str(mode).lower() != "wal":
         raise RunWorkspaceError(
-            f"Run Output Root filesystem failed WAL admission: SQLite returned {mode!r}"
+            "Run Workspace Root filesystem failed WAL admission: "
+            f"SQLite returned {mode!r}"
         )
     connection.execute("PRAGMA synchronous = FULL")
 

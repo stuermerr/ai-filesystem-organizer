@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
+from collections import namedtuple
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +21,170 @@ from filesystem_organizer.content_identity import (
     FileObservation,
     hash_regular_file,
 )
+from filesystem_organizer.run_workspace import WorkspaceCapabilities
+from filesystem_organizer.structural_relationships import StructuralEvidenceProjection
+
+
+def _workspace_capabilities(
+    root: Path, *, maximum: int, free: int
+) -> WorkspaceCapabilities:
+    return WorkspaceCapabilities(
+        root=str(root.resolve()),
+        filesystem_type="vfat" if maximum == (1 << 32) - 1 else "ext4",
+        file_size_bits=maximum.bit_length(),
+        maximum_file_size=maximum,
+        free_bytes=free,
+        writable_directory_creation=True,
+        sqlite_wal=True,
+    )
+
+
+def test_small_projected_run_is_admitted_on_four_gib_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "small.txt").write_text("small")
+    output_root = tmp_path / "output"
+    maximum = (1 << 32) - 1
+    monkeypatch.setattr(
+        analysis_run,
+        "admit_workspace_root",
+        lambda workspace, _selected: _workspace_capabilities(
+            workspace, maximum=maximum, free=20_000_000_000
+        ),
+    )
+
+    result = create_analysis_run(selected_root, output_root)
+
+    admission = cast(dict[str, object], result["workspace_admission"])
+    assert admission["workspace_filesystem_type"] == "vfat"
+    assert cast(int, admission["required_single_file_capacity"]) < maximum
+
+
+def test_intenso_scale_projection_is_refused_before_hashing_from_one_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    output_root = tmp_path / "output"
+    maximum = (1 << 32) - 1
+    collected = 0
+    entries = [
+        analysis_run.InventoryEntry(
+            ".", "directory", None, 1, "successful", is_empty=False
+        ),
+        analysis_run.InventoryEntry("one.bin", "regular-file", 1, 1, "successful"),
+        analysis_run.InventoryEntry("two.bin", "regular-file", 1, 1, "successful"),
+    ]
+
+    def collect_once(_root: Path) -> list[analysis_run.InventoryEntry]:
+        nonlocal collected
+        collected += 1
+        return entries
+
+    projected_rows = 6_906_865
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: usage(40_000_000_000, 10_000_000_000, 30_000_000_000),
+    )
+    monkeypatch.setattr(analysis_run, "_collect_entries", collect_once)
+    monkeypatch.setattr(
+        analysis_run,
+        "project_structural_evidence",
+        lambda _entries: StructuralEvidenceProjection(
+            row_count=projected_rows,
+            indexed_text_bytes=3_500_000_000,
+            estimated_storage_bytes=projected_rows * 1000,
+        ),
+    )
+    monkeypatch.setattr(
+        analysis_run,
+        "admit_workspace_root",
+        lambda workspace, _selected: _workspace_capabilities(
+            workspace, maximum=maximum, free=30_000_000_000
+        ),
+    )
+    monkeypatch.setattr(
+        analysis_run,
+        "hash_regular_file",
+        lambda *_args, **_kwargs: pytest.fail("workspace refusal must precede hashing"),
+    )
+
+    with pytest.raises(AnalysisRunError, match=r"6,906,865|6906865") as refusal:
+        create_analysis_run(selected_root, output_root)
+
+    message = str(refusal.value)
+    assert "workspace filesystem vfat" in message
+    assert "maximum single-file size 4294967295" in message
+    assert "estimated database size" in message
+    assert "available free space 30000000000" in message
+    assert "--workspace-root" in message
+    assert collected == 1
+    assert not output_root.exists()
+
+
+def test_sufficient_workspace_capacity_allows_hashing_to_begin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "one.bin").write_bytes(b"same")
+    (selected_root / "two.bin").write_bytes(b"same")
+    workspace_root = tmp_path / "workspace"
+    hashed: list[str] = []
+    original_hash = hash_regular_file
+    monkeypatch.setattr(
+        analysis_run,
+        "admit_workspace_root",
+        lambda workspace, _selected: _workspace_capabilities(
+            workspace, maximum=(1 << 63) - 1, free=30_000_000_000
+        ),
+    )
+
+    def record_hash(*args: object, **kwargs: object) -> ContentIdentity:
+        hashed.append(str(args[1]))
+        return original_hash(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(analysis_run, "hash_regular_file", record_hash)
+
+    create_analysis_run(
+        selected_root, tmp_path / "output", workspace_root=workspace_root
+    )
+
+    assert hashed == ["one.bin", "two.bin"]
+
+
+def test_projected_rows_match_persisted_ancestor_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    (selected_root / "a" / "b").mkdir(parents=True)
+    (selected_root / "a" / "b" / "file.txt").write_text("one")
+    original_collect = analysis_run._collect_entries
+    collections = 0
+
+    def collect_once(root: Path) -> list[analysis_run.InventoryEntry]:
+        nonlocal collections
+        collections += 1
+        return original_collect(root)
+
+    monkeypatch.setattr(analysis_run, "_collect_entries", collect_once)
+    result = create_analysis_run(selected_root, tmp_path / "output")
+    run_path = Path(str(result["analysis_run"]))
+    with sqlite3.connect(run_path / "analysis.sqlite3") as connection:
+        persisted = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM structural_shared_descendants"
+            ).fetchone()[0]
+        )
+
+    admission = cast(dict[str, object], result["workspace_admission"])
+    assert admission["projected_structural_rows"] == 6
+    assert persisted == 6
+    assert collections == 1
 
 
 def test_scan_leaves_unique_files_as_metadata_plan_evidence(
@@ -54,6 +221,180 @@ def test_scan_leaves_unique_files_as_metadata_plan_evidence(
         ("large.txt", "metadata-observation", None, None),
         ("small.txt", "metadata-observation", None, None),
     ]
+
+
+def test_metadata_admission_reuses_inventory_and_refuses_before_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "first.bin").write_bytes(b"12345")
+    (selected_root / "second.bin").write_bytes(b"12345")
+    destination = tmp_path / "result"
+    original_collect = analysis_run._collect_entries
+    collection_count = 0
+
+    def counted_collect(root: Path) -> list[analysis_run.InventoryEntry]:
+        nonlocal collection_count
+        collection_count += 1
+        return original_collect(root)
+
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(analysis_run, "_collect_entries", counted_collect)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: usage(10, 9, 1))
+    monkeypatch.setattr(
+        analysis_run,
+        "hash_regular_file",
+        lambda *_args, **_kwargs: pytest.fail("metadata refusal must precede hashing"),
+    )
+
+    with pytest.raises(AnalysisRunError, match="insufficient free space"):
+        create_analysis_run(
+            selected_root, tmp_path / "output", destination=destination
+        )
+
+    assert collection_count == 1
+    assert not (tmp_path / "output").exists()
+
+
+def test_default_destination_metadata_admission_precedes_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "large.bin").write_bytes(b"12345")
+    output_root = tmp_path / "output"
+    run_id = "11111111-1111-1111-1111-111111111111"
+    expected_destination = output_root / "materialized" / run_id
+    observed_destinations: list[Path] = []
+    original_collect = analysis_run._collect_entries
+    original_admission = analysis_run._admit_metadata_inventory
+    collection_count = 0
+
+    def counted_collect(root: Path) -> list[analysis_run.InventoryEntry]:
+        nonlocal collection_count
+        collection_count += 1
+        return original_collect(root)
+
+    def recorded_admission(
+        entries: list[analysis_run.InventoryEntry], destination: Path
+    ) -> analysis_run.MetadataAdmission:
+        observed_destinations.append(destination)
+        return original_admission(entries, destination)
+
+    monkeypatch.setattr(analysis_run, "_collect_entries", counted_collect)
+    monkeypatch.setattr(analysis_run, "_admit_metadata_inventory", recorded_admission)
+    monkeypatch.setattr(
+        analysis_run, "_destination_max_file_size", lambda _path: ("vfat", 4)
+    )
+    monkeypatch.setattr(
+        analysis_run,
+        "hash_regular_file",
+        lambda *_args, **_kwargs: pytest.fail("metadata refusal must precede hashing"),
+    )
+
+    with pytest.raises(AnalysisRunError, match="maximum supported file size"):
+        create_analysis_run(selected_root, output_root, run_id=run_id)
+
+    assert observed_destinations == [expected_destination.resolve()]
+    assert collection_count == 1
+    assert expected_destination != output_root
+    assert not output_root.exists()
+
+
+def test_default_destination_capacity_admission_precedes_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "first.bin").write_bytes(b"12345")
+    (selected_root / "second.bin").write_bytes(b"12345")
+    output_root = tmp_path / "output"
+    run_id = "22222222-2222-2222-2222-222222222222"
+    usage = namedtuple("usage", "total used free")
+
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: usage(10, 9, 1))
+    monkeypatch.setattr(
+        analysis_run,
+        "hash_regular_file",
+        lambda *_args, **_kwargs: pytest.fail("metadata refusal must precede hashing"),
+    )
+
+    with pytest.raises(AnalysisRunError, match="insufficient free space"):
+        create_analysis_run(selected_root, output_root, run_id=run_id)
+
+    assert not output_root.exists()
+
+
+def test_metadata_admission_refuses_known_destination_file_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "large.bin").write_bytes(b"12345")
+    monkeypatch.setattr(
+        analysis_run, "_destination_max_file_size", lambda _path: ("vfat", 4)
+    )
+    monkeypatch.setattr(
+        analysis_run,
+        "hash_regular_file",
+        lambda *_args, **_kwargs: pytest.fail("metadata refusal must precede hashing"),
+    )
+
+    with pytest.raises(AnalysisRunError, match="maximum supported file size"):
+        create_analysis_run(
+            selected_root, tmp_path / "output", destination=tmp_path / "result"
+        )
+
+
+def test_metadata_admission_reports_inaccessible_entries_for_plan_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    observed = [
+        analysis_run.InventoryEntry(
+            ".", "directory", None, 1, "successful", is_empty=False
+        ),
+        analysis_run.InventoryEntry(
+            "blocked", "unknown", None, None, "unreadable", "unreadable"
+        ),
+    ]
+    monkeypatch.setattr(analysis_run, "_collect_entries", lambda _root: observed)
+
+    result = create_analysis_run(
+        selected_root, tmp_path / "output", destination=tmp_path / "result"
+    )
+
+    admission = cast(dict[str, object], result["metadata_admission"])
+    assert admission["inaccessible_entry_count"] == 1
+    assert isinstance(admission["destination_name_max"], int)
+    assert admission["destination_name_max"] > 0
+    assert isinstance(admission["destination_path_max"], int)
+    assert admission["destination_path_max"] > 0
+
+
+def test_metadata_admission_reports_destination_name_and_path_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    entries = [
+        analysis_run.InventoryEntry(
+            "long-name.txt", "regular-file", 1, 1, "successful"
+        )
+    ]
+    monkeypatch.setattr(
+        analysis_run, "_destination_max_file_size", lambda _path: ("testfs", 100)
+    )
+
+    def path_limit(_path: Path, name: str) -> int:
+        return 4 if name == "PC_NAME_MAX" else 8
+
+    monkeypatch.setattr(os, "pathconf", path_limit)
+    admission = analysis_run._admit_metadata_inventory(entries, destination)
+
+    assert admission.destination_name_incompatibility_count == 1
+    assert admission.destination_path_incompatibility_count == 1
 
 
 def test_scan_proves_empty_duplicate_group_without_reading_payload(
@@ -98,7 +439,7 @@ def test_scan_refuses_non_wal_run_output_root_and_removes_incomplete_run(
     with pytest.raises(AnalysisRunError, match="failed WAL admission"):
         create_analysis_run(selected_root, output_root)
 
-    assert list((output_root / "runs").iterdir()) == []
+    assert not output_root.exists()
 
 
 def test_resume_reuses_persisted_structural_schema_after_interruption(

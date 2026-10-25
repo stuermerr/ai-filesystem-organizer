@@ -5,8 +5,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from ..exact_duplicate_groups import READ_OUTCOME_SUCCESSFUL
+from .inventory_projection import InventoryProjectionIndex
 from .models import ConflictSourceMapping, PlanOutputEntry
-from .paths import is_within
 
 
 @dataclass(frozen=True)
@@ -44,28 +44,20 @@ class ConflictProjectionResult:
 
 
 def _load_records(
-    connection: sqlite3.Connection, run_id: str, roots: tuple[str, ...]
+    connection: sqlite3.Connection,
+    run_id: str,
+    roots: tuple[str, ...],
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> list[_CopyableRecord]:
-    rows = connection.execute(
-        "SELECT inventory.relative_path, inventory.entry_kind, inventory.read_outcome, "
-        "inventory.modified_ns, identity.algorithm, identity.algorithm_version, "
-        "identity.byte_size, identity.digest, identity.read_outcome AS identity_outcome "
-        "FROM inventory_entries AS inventory LEFT JOIN content_identities AS identity "
-        "ON identity.run_id = inventory.run_id "
-        "AND identity.relative_path = inventory.relative_path "
-        "WHERE inventory.run_id = ? ORDER BY inventory.relative_path",
-        (run_id,),
-    ).fetchall()
+    index = inventory_index or InventoryProjectionIndex.load(connection, run_id)
     records: list[_CopyableRecord] = []
     for root in roots:
-        for row in rows:
-            source = str(row["relative_path"])
-            if source == root or not is_within(source, root):
-                continue
+        for row in index.descendants(root):
+            source = row.relative_path
             relative = source if root == "." else source[len(root) + 1 :]
             if (
-                row["entry_kind"] == "directory"
-                and row["read_outcome"] == READ_OUTCOME_SUCCESSFUL
+                row.entry_kind == "directory"
+                and row.read_outcome == READ_OUTCOME_SUCCESSFUL
             ):
                 records.append(
                     _CopyableRecord(
@@ -73,31 +65,34 @@ def _load_records(
                     )
                 )
             elif (
-                row["entry_kind"] == "regular-file"
-                and row["read_outcome"] == READ_OUTCOME_SUCCESSFUL
-                and row["identity_outcome"] == READ_OUTCOME_SUCCESSFUL
+                row.entry_kind == "regular-file"
+                and row.read_outcome == READ_OUTCOME_SUCCESSFUL
+                and row.identity_outcome == READ_OUTCOME_SUCCESSFUL
             ):
                 records.append(
                     _CopyableRecord(
                         source,
                         relative,
                         "file",
-                        str(row["algorithm"]),
-                        int(row["algorithm_version"]),
-                        int(row["byte_size"]),
-                        str(row["digest"]),
-                        None if row["modified_ns"] is None else int(row["modified_ns"]),
+                        row.algorithm,
+                        row.algorithm_version,
+                        row.byte_size,
+                        row.digest,
+                        row.modified_ns,
                     )
                 )
     return records
 
 
 def component_has_conflict(
-    connection: sqlite3.Connection, run_id: str, roots: tuple[str, ...]
+    connection: sqlite3.Connection,
+    run_id: str,
+    roots: tuple[str, ...],
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> bool:
     """Independently validate all corresponding paths in a proposed group."""
     evidence_by_relative: dict[str, set[tuple[object, ...]]] = defaultdict(set)
-    for record in _load_records(connection, run_id, roots):
+    for record in _load_records(connection, run_id, roots, inventory_index):
         if record.entry_kind == "directory":
             evidence: tuple[object, ...] = ("directory",)
         else:
@@ -127,9 +122,10 @@ def project_lossless_conflicts(
     roots: tuple[str, ...],
     canonical_root: str,
     conflict_namespace: str,
+    inventory_index: InventoryProjectionIndex | None = None,
 ) -> ConflictProjectionResult:
     """Apply the latest-primary policy after complete group validation."""
-    records = _load_records(connection, run_id, roots)
+    records = _load_records(connection, run_id, roots, inventory_index)
     kinds_by_relative: dict[str, set[str]] = defaultdict(set)
     for record in records:
         kinds_by_relative[record.relative].add(record.entry_kind)

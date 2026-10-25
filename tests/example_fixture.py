@@ -8,7 +8,6 @@ from typing import TypedDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "example_source"
-OUTPUT_ROOT = PROJECT_ROOT / "example_output"
 MANIFEST_PATH = PROJECT_ROOT / "example_fixture_manifest.json"
 
 

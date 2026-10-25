@@ -4,27 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "filesystem-organizer"
-version = "0.1.0"
-description = "Safe filesystem consolidation and reorganization CLI"
+version = "0.2.0"
+description = "AI-guided filesystem consolidation with a deterministic safety-first CLI"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Environment :: Console",
-    "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: System :: Filesystems",
-]
 dependencies = [
     "blake3>=1.0.9",
     "tqdm>=4.70.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/stuermerr/filesystem-organizer"
-Issues = "https://github.com/stuermerr/filesystem-organizer/issues"
-Repository = "https://github.com/stuermerr/filesystem-organizer"
+Homepage = "https://github.com/stuermerr/ai-filesystem-organizer"
+Issues = "https://github.com/stuermerr/ai-filesystem-organizer/issues"
+Repository = "https://github.com/stuermerr/ai-filesystem-organizer"
 
 [project.scripts]
 filesystem-organizer = "filesystem_organizer.__main__:main"

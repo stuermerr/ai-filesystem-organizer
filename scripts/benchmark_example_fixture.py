@@ -83,16 +83,8 @@ def _run_once() -> dict[str, Any]:
         _, stages["plan-finalize"] = _run_command(
             "plan-finalize", str(run_path), "--plan-id", plan_id
         )
-        materialize_usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        materialize_output, stages["materialize"] = _run_command(
-            "materialize", str(run_path), plan_id, "--yes"
-        )
-        materialize_usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        materialized = json.loads(materialize_output)
-        total_seconds = time.perf_counter() - total_started
-        usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-
         database_path = run_path / "analysis.sqlite3"
+        database_bytes_before_cleanup = database_path.stat().st_size
         with sqlite3.connect(database_path) as connection:
             inventory_entries = int(
                 connection.execute("SELECT COUNT(*) FROM inventory_entries").fetchone()[
@@ -118,32 +110,14 @@ def _run_once() -> dict[str, Any]:
                     "SELECT comparison_count FROM structural_analysis"
                 ).fetchone()[0]
             )
-            materialization_journal_rows = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM materialization_events WHERE plan_id = ?",
-                    (plan_id,),
-                ).fetchone()[0]
-            )
-            attempt = connection.execute(
-                "SELECT cloned_file_count, cloned_byte_count, streamed_file_count, "
-                "streamed_byte_count FROM materialization_attempts WHERE plan_id = ?",
-                (plan_id,),
-            ).fetchone()
-            execution_evidence_rows = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM execution_file_evidence WHERE plan_id = ?",
-                    (plan_id,),
-                ).fetchone()[0]
-            )
-            successful_path_bytes = int(
-                connection.execute(
-                    "SELECT COALESCE(SUM(expected_byte_size), 0) "
-                    "FROM execution_manifest_entries AS entry "
-                    "JOIN execution_manifests AS manifest USING (attempt_id) "
-                    "WHERE manifest.plan_id = ? AND entry.entry_kind = 'file'",
-                    (plan_id,),
-                ).fetchone()[0]
-            )
+        materialize_usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        materialize_output, stages["materialize"] = _run_command(
+            "materialize", str(run_path), plan_id, "--yes"
+        )
+        materialize_usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        materialized = json.loads(materialize_output)
+        total_seconds = time.perf_counter() - total_started
+        usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
 
         destination = Path(str(materialized["destination"]))
         return {
@@ -151,7 +125,10 @@ def _run_once() -> dict[str, Any]:
             "source_files": len(source_files),
             "source_bytes": source_bytes,
             "stages": stages,
-            "database_bytes": database_path.stat().st_size,
+            "database_bytes": 0
+            if not database_path.exists()
+            else database_path.stat().st_size,
+            "database_bytes_before_cleanup": database_bytes_before_cleanup,
             "wal_bytes": (
                 database_path.with_name(database_path.name + "-wal").stat().st_size
                 if database_path.with_name(database_path.name + "-wal").exists()
@@ -177,14 +154,16 @@ def _run_once() -> dict[str, Any]:
             "materialize_output_blocks": (
                 materialize_usage_after.ru_oublock - materialize_usage_before.ru_oublock
             ),
-            "successful_path_source_bytes_read": successful_path_bytes,
-            "successful_path_destination_bytes_written": successful_path_bytes,
-            "materialization_journal_rows": materialization_journal_rows,
-            "execution_evidence_rows": execution_evidence_rows,
-            "cloned_file_count": int(attempt[0]),
-            "cloned_byte_count": int(attempt[1]),
-            "streamed_file_count": int(attempt[2]),
-            "streamed_byte_count": int(attempt[3]),
+            "successful_path_source_bytes_read": int(materialized["total_bytes"]),
+            "successful_path_destination_bytes_written": int(
+                materialized["total_bytes"]
+            ),
+            "materialization_journal_rows": 0,
+            "execution_evidence_rows": int(materialized["operation_count"]),
+            "cloned_file_count": int(materialized["cloned_file_count"]),
+            "cloned_byte_count": int(materialized["cloned_byte_count"]),
+            "streamed_file_count": int(materialized["streamed_file_count"]),
+            "streamed_byte_count": int(materialized["streamed_byte_count"]),
             "input_blocks": usage_after.ru_inblock - usage_before.ru_inblock,
             "output_blocks": usage_after.ru_oublock - usage_before.ru_oublock,
             "max_rss_kib": usage_after.ru_maxrss,
@@ -197,6 +176,7 @@ def _median(runs: list[dict[str, Any]]) -> dict[str, int | float]:
         "source_files",
         "source_bytes",
         "database_bytes",
+        "database_bytes_before_cleanup",
         "wal_bytes",
         "workspace_bytes",
         "inventory_entries",

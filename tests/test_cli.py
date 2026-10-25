@@ -6,7 +6,9 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from blake3 import blake3
 
 from filesystem_organizer.progress import ProgressReporter
@@ -42,6 +44,332 @@ def run_cli(
         capture_output=True,
         check=False,
     )
+
+
+def test_scan_admission_cli_reports_supported_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    result = run_cli(
+        tmp_path,
+        "scan-admission",
+        str(source),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--destination",
+        str(tmp_path / "result"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"publication_method":' in result.stdout
+
+
+def test_source_probe_cli_reports_public_mount_and_access_facts(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    result = run_cli(tmp_path, "source-probe", str(source))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["resolved_source"] == str(source.resolve())
+    assert payload["source_root_readable"] is True
+    assert payload["source_root_traversable"] is True
+    assert isinstance(payload["source_writable"], bool)
+    assert payload["effective_mount_root"]
+    assert payload["filesystem_type"]
+    assert isinstance(payload["mount_read_only"], bool)
+    assert isinstance(payload["filesystem_device"], int)
+
+
+def test_in_place_scan_admission_reports_executor_and_leaves_no_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    result = run_cli(
+        tmp_path,
+        "scan-admission",
+        str(source),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--in-place",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["execution_mode"] == "in-place"
+    assert payload["executor_kind"] == "hard-link-protection"
+    assert payload["executor_version"] == 1
+    assert list(source.iterdir()) == []
+    assert not (tmp_path / "runs").exists()
+
+
+def test_scan_persists_explicit_execution_intent_and_refuses_mode_change(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("payload")
+
+    scan = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--in-place",
+    )
+
+    assert scan.returncode == 0, scan.stderr
+    scanned = json.loads(scan.stdout)
+    assert scanned["execution_mode"] == "in-place"
+    assert scanned["executor_kind"] == "hard-link-protection"
+    run_path = Path(scanned["analysis_run"])
+    with sqlite3.connect(run_path / "analysis.sqlite3") as connection:
+        intent = connection.execute(
+            "SELECT execution_mode, executor_kind, executor_version, "
+            "admission_version, admitted_at "
+            "FROM analysis_run_execution_intent"
+        ).fetchone()
+    assert intent is not None
+    assert intent[:4] == ("in-place", "hard-link-protection", 1, 1)
+    assert intent[4]
+
+    plan = run_cli(tmp_path, "plan", str(run_path))
+    assert plan.returncode == 0, plan.stderr
+    plan_id = json.loads(plan.stdout)["plan_id"]
+    finalized = run_cli(tmp_path, "plan-finalize", str(run_path), "--plan-id", plan_id)
+    assert finalized.returncode == 0, finalized.stderr
+
+    refused = run_cli(tmp_path, "materialize-preflight", str(run_path), plan_id)
+    assert refused.returncode == 1
+    assert "admitted execution mode is in-place" in refused.stderr
+
+
+def test_scan_destination_and_in_place_are_mutually_exclusive(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    result = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--destination",
+        str(tmp_path / "result"),
+        "--in-place",
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
+
+
+def test_scan_cheap_admission_uses_derived_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from filesystem_organizer import __main__ as cli
+
+    source = tmp_path / "source"
+    source.mkdir()
+    output_root = tmp_path / "output"
+    run_id = "33333333-3333-3333-3333-333333333333"
+    expected_destination = (output_root / "materialized" / run_id).resolve()
+    admitted: list[tuple[Path, Path, Path | None]] = []
+
+    def admit(
+        selected: Path,
+        output: Path,
+        destination: Path | None,
+        _workspace: Path | None,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        admitted.append((selected, output, destination))
+        return SimpleNamespace(
+            execution_mode="source-preserving",
+            executor_kind="source-preserving",
+            executor_version=1,
+            execution_admission_version=1,
+            execution_admitted_at="now",
+        )
+
+    monkeypatch.setattr(cli, "uuid4", lambda: run_id)
+    monkeypatch.setattr(cli, "admit_scan_environment", admit)
+    monkeypatch.setattr(
+        cli,
+        "create_analysis_run",
+        lambda selected, output, **kwargs: {
+            "analysis_run": str(output_root / "runs" / run_id),
+            "run_id": kwargs["run_id"],
+        },
+    )
+
+    assert cli.main(["scan", str(source), "--output-root", str(output_root)]) == 0
+
+    assert admitted == [(source, output_root, expected_destination)]
+    assert json.loads(capsys.readouterr().out)["run_id"] == run_id
+
+
+def test_scan_accepts_destination_for_reused_metadata_admission(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_bytes(b"data")
+
+    result = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--destination",
+        str(tmp_path / "result"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["metadata_admission"]["observed_file_count"] == 1
+    assert payload["metadata_admission"]["total_observed_bytes"] == 4
+    assert payload["materialized_destination"] == str((tmp_path / "result").resolve())
+
+
+def test_scan_uses_separate_workspace_without_changing_default_destination(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_bytes(b"data")
+    output_root = tmp_path / "output"
+    workspace_root = tmp_path / "workspace"
+
+    scan = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(output_root),
+        "--workspace-root",
+        str(workspace_root),
+    )
+
+    assert scan.returncode == 0, scan.stderr
+    payload = json.loads(scan.stdout)
+    assert Path(payload["analysis_run"]).parent.parent == workspace_root.resolve()
+    assert payload["run_output_root"] == str(output_root.resolve())
+    assert payload["run_workspace_root"] == str(workspace_root.resolve())
+    assert payload["materialized_destination"] == str(
+        output_root.resolve() / "materialized" / payload["run_id"]
+    )
+
+
+def test_explicit_destination_remains_authoritative_with_separate_workspace(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_bytes(b"data")
+    output_root = tmp_path / "output"
+    workspace_root = tmp_path / "workspace"
+    destination = tmp_path / "exact-result"
+
+    scan = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(output_root),
+        "--workspace-root",
+        str(workspace_root),
+        "--destination",
+        str(destination),
+    )
+
+    assert scan.returncode == 0, scan.stderr
+    payload = json.loads(scan.stdout)
+    assert Path(payload["analysis_run"]).parent.parent == workspace_root.resolve()
+    assert payload["materialized_destination"] == str(destination.resolve())
+
+
+def test_explicit_destination_propagates_from_scan_to_plan_and_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_bytes(b"data")
+    output_root = tmp_path / "runs"
+    destination = tmp_path / "result"
+
+    scan = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(output_root),
+        "--destination",
+        str(destination),
+    )
+    assert scan.returncode == 0, scan.stderr
+    run_path = json.loads(scan.stdout)["analysis_run"]
+
+    plan = run_cli(tmp_path, "plan", run_path)
+    assert plan.returncode == 0, plan.stderr
+    plan_id = json.loads(plan.stdout)["plan_id"]
+    assert json.loads(plan.stdout)["intended_destination"] == str(destination.resolve())
+
+    finalized = run_cli(tmp_path, "plan-finalize", run_path, "--plan-id", plan_id)
+    assert finalized.returncode == 0, finalized.stderr
+    preflight = run_cli(tmp_path, "materialize-preflight", run_path, plan_id)
+    assert preflight.returncode == 0, preflight.stderr
+    assert json.loads(preflight.stdout)["destination"] == str(destination.resolve())
+
+    materialized = run_cli(tmp_path, "materialize", run_path, plan_id, "--yes")
+    assert materialized.returncode == 0, materialized.stderr
+    assert json.loads(materialized.stdout)["destination"] == str(destination.resolve())
+    assert (destination / "file.txt").read_bytes() == b"data"
+
+
+def test_scan_with_destination_enforces_cheap_admission_first(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "result"
+    destination.mkdir()
+
+    result = run_cli(
+        tmp_path,
+        "scan",
+        str(source),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--destination",
+        str(destination),
+    )
+
+    assert result.returncode == 1
+    assert "destination already exists" in result.stderr
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("command", ["scan-admission", "scan"])
+def test_scan_commands_refuse_equal_output_root_and_destination_before_state_creation(
+    tmp_path: Path, command: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    output_root = tmp_path / "output"
+
+    result = run_cli(
+        tmp_path,
+        command,
+        str(source),
+        "--output-root",
+        str(output_root),
+        "--destination",
+        str(output_root / "."),
+    )
+
+    assert result.returncode == 1
+    assert "must not equal" in result.stderr
+    assert not output_root.exists()
 
 
 def test_scan_and_report_persist_inventory_without_changing_selected_backup_root(
@@ -338,8 +666,15 @@ def test_full_plan_report_bounds_union_omissions(tmp_path: Path) -> None:
     assert report.stdout.count(": symbolic-link") == 20
     assert "Showing the first 20 of 60" in report.stdout
     page = run_cli(
-        tmp_path, "plan-report", run_path, "--section", "skipped",
-        "--offset", "55", "--limit", "5",
+        tmp_path,
+        "plan-report",
+        run_path,
+        "--section",
+        "skipped",
+        "--offset",
+        "55",
+        "--limit",
+        "5",
     )
     assert page.returncode == 0, page.stderr
     assert "`beta/skipped-29`" in page.stdout
@@ -762,7 +1097,7 @@ def test_in_place_custom_layout_exclusion_removes_the_proven_identity_after_comp
     documents.mkdir(parents=True)
     (documents / "keep.txt").write_bytes(b"keep")
     (documents / "exclude.txt").write_bytes(b"exclude")
-    scan = run_cli(tmp_path, "scan", str(selected_root))
+    scan = run_cli(tmp_path, "scan", str(selected_root), "--in-place")
     run_path = Path(json.loads(scan.stdout)["analysis_run"])
     plan = run_cli(tmp_path, "plan", str(run_path))
     plan_id = str(json.loads(plan.stdout)["plan_id"])
@@ -807,7 +1142,6 @@ def test_in_place_custom_layout_exclusion_removes_the_proven_identity_after_comp
         str(run_path),
         plan_id,
         "--in-place",
-        "--yes",
         "--acknowledge-destructive",
     )
     assert materialized.returncode == 0, materialized.stderr
@@ -880,7 +1214,7 @@ def test_scan_rejects_runs_symlink_that_escapes_run_output_root(tmp_path: Path) 
     )
 
     assert scan.returncode == 1
-    assert "Analysis Run must remain under the Run Output Root" in scan.stderr
+    assert "Analysis Run must remain under the Run Workspace Root" in scan.stderr
     assert list(redirected_runs.iterdir()) == []
 
 
@@ -918,9 +1252,10 @@ def test_report_refuses_analysis_run_with_ambiguous_run_identity(
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO analysis_runs VALUES "
-            "('other-run', 'other-snapshot', 1, ?, 'complete', ?, ?, NULL, NULL, NULL)",
+            "('other-run', 'other-snapshot', 1, ?, ?, 'complete', ?, ?, NULL, NULL, NULL)",
             (
                 str(selected_root),
+                str((tmp_path / "other-result").resolve()),
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
             ),
@@ -978,75 +1313,59 @@ def test_scan_and_report_produce_complete_deterministic_example_inventory(
     assert strip_identity(first_report.stdout) == strip_identity(second_report.stdout)
 
     report_body = first_report.stdout
-    assert "| `snapshot-2025-07-01/.DS_Store` |" in report_body
+    assert first_result["inventory_count"] == 35
+    assert first_result["skipped_count"] == 0
     assert (
-        "| `snapshot-2025-07-01/Home/Desktop/empty-file.txt` | regular-file | 0 |"
+        "| `LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf` | regular-file |"
         in report_body
     )
-    assert "| `snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt` |" in report_body
-    assert "| `snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt` |" in report_body
     assert (
-        "| `snapshot-2025-07-01/Home/Desktop/link-to-annual-tax-statement` | symbolic-link |"
+        "| `Random Stuff - SORT LATER (2019)/Old iPhone photos maybe/IMG_0001.JPG` |"
         in report_body
     )
     skipped_section = report_body.split("## Skipped Entry Findings", maxsplit=1)[1]
-    assert (
-        "| `snapshot-2025-07-01/Home/Desktop/link-to-annual-tax-statement` | symbolic-link |"
-        in skipped_section
-    )
-    assert "| `snapshot-2025-07-01/Home/Desktop/unreadable.txt` |" in skipped_section
+    assert skipped_section.lstrip().startswith("None.")
 
     duplicate_groups_section = report_body.split(
         "## Exact Duplicate Groups", maxsplit=1
     )[1]
     assert "None." not in duplicate_groups_section.splitlines()[0:2]
 
-    recovery_group = next(
+    camera_group = next(
         block
         for block in duplicate_groups_section.split("### ")[1:]
-        if "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
-        in block
+        if "IMG_1042" in block
     )
     assert (
-        "**Canonical Copy:** `snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt`"
-        in recovery_group
+        "**Canonical Copy:** `LAPTOP OLD - DO NOT DELETE/Pictures/Camera/IMG_1042.JPG`"
+        in camera_group
     )
-    assert "newest modification timestamp" in recovery_group
+    assert "newest modification timestamp" in camera_group
     canonical_row = next(
         line
-        for line in recovery_group.splitlines()
+        for line in camera_group.splitlines()
         if line.startswith(
-            "| `snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt` |"
+            "| `LAPTOP OLD - DO NOT DELETE/Pictures/Camera/IMG_1042.JPG` |"
         )
     )
     assert canonical_row.rstrip().endswith("| yes |")
-    assert (
-        "snapshot-2025-07-01/Home/Desktop/recovery-checklist (copy).txt"
-        in recovery_group
-    )
-    assert (
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
-        in recovery_group
-    )
+    assert "PHONE BACKUP DO NOT FORMAT/DCIM/Camera/IMG_1042.JPG" in camera_group
+    assert "USB BACKUP NEWEST I THINK/DCIM copy FINAL/IMG_1042 copy.JPG" in camera_group
 
     tax_group = next(
         block
         for block in duplicate_groups_section.split("### ")[1:]
-        if "annual_tax_statement_2024" in block
+        if "Tax 2023" in block
     )
     assert (
-        "**Canonical Copy:** `snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024.pdf`"
+        "**Canonical Copy:** `LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf`"
         in tax_group
     )
-    assert (
-        "snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024 (copy).pdf"
-        in tax_group
-    )
+    assert "USB BACKUP NEWEST I THINK/important/Tax 2023 FINAL copy.pdf" in tax_group
     assert "newest modification timestamp" in tax_group
 
     assert not any(
-        "snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt" in block
-        and "snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt" in block
+        "CV final FINAL 2.docx" in block and "CV current.docx" in block
         for block in duplicate_groups_section.split("### ")[1:]
     )
 
@@ -1077,6 +1396,7 @@ def test_resume_continues_interrupted_scan_from_checkpoint(tmp_path: Path) -> No
         selected_root: Path,
         resume_after: str | None,
         progress: ProgressReporter,
+        entries: list[analysis_run.InventoryEntry] | None = None,
     ) -> None:
         call_count["value"] += 1
         if call_count["value"] == 1:
@@ -1089,7 +1409,7 @@ def test_resume_continues_interrupted_scan_from_checkpoint(tmp_path: Path) -> No
             )
             raise RuntimeError("simulated interruption after first batch")
         original_run_scan_batches(
-            connection, run_id, selected_root, resume_after, progress
+            connection, run_id, selected_root, resume_after, progress, entries
         )
 
     analysis_run.BATCH_SIZE = 3

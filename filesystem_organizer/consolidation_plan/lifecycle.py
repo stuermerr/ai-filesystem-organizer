@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
@@ -16,7 +17,9 @@ from ..run_workspace import (
     resolve_run_directory,
     select_plan_row,
 )
+from ..workflow_progress import WorkflowProgress
 from .custom_layout import finalize_layout_projection, initialize_layout_baseline
+from .inventory_projection import InventoryProjectionIndex
 from .models import (
     PLAN_SCHEMA_VERSION,
     PLAN_STATUS_DRAFT,
@@ -39,13 +42,17 @@ from .projection import (
 
 @run_workspace_refusal
 def create_consolidation_plan(
-    analysis_run: Path, *, progress: ProgressReporter | None = None
+    analysis_run: Path,
+    *,
+    progress: ProgressReporter | None = None,
+    performance_metrics: dict[str, int] | None = None,
 ) -> dict[str, object]:
     """Create a draft plan and report its coarse-grained phases when requested."""
     reporter = progress or NullProgressReporter()
     run_path, database_path = resolve_run_directory(analysis_run)
 
     connection = open_wal_read_write(database_path)
+    persisted_progress: WorkflowProgress | None = None
     try:
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute("SELECT * FROM analysis_runs").fetchall()
@@ -69,13 +76,46 @@ def create_consolidation_plan(
         run_id = str(row["run_id"])
         snapshot_id = str(row["snapshot_id"])
         selected_root = Path(str(row["selected_backup_root"]))
+        plan_id = str(uuid.uuid4())
+        inventory_total = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM inventory_entries WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+        )
+        persisted_progress = WorkflowProgress(
+            connection,
+            "plan-derivation",
+            run_id,
+            plan_id=plan_id,
+            phase="indexing-inventory",
+            total_count=inventory_total,
+        )
 
         reporter.start("Preparing plan")
         _create_plan_schema(connection)
 
         reporter.start("Deriving plan operations")
+        inventory_index = InventoryProjectionIndex.load(
+            connection,
+            run_id,
+            performance_metrics,
+            persisted_progress.update,
+        )
+        persisted_progress.phase(
+            "deriving-operations",
+            completed_count=len(inventory_index.records),
+            total_count=inventory_total,
+        )
         operations = _retained_operations(connection, run_id)
-        structural_projections = _structural_projections(connection, run_id)
+        persisted_progress.phase(
+            "classifying-structural-groups",
+            completed_count=0,
+            total_count=None,
+            unit="groups",
+        )
+        structural_projections = _structural_projections(
+            connection, run_id, inventory_index
+        )
         structural_unions = [
             projection
             for projection in structural_projections
@@ -88,7 +128,16 @@ def create_consolidation_plan(
         ]
         reporter.start("Projecting directory structure")
         structural_entries, covered_files, structural_roots, conflict_mappings = (
-            _structural_entries(connection, run_id, structural_projections)
+            _structural_entries(
+                connection, run_id, structural_projections, inventory_index
+            )
+        )
+        persisted_progress.phase(
+            "validating-projection",
+            completed_count=len(covered_files),
+            total_count=len(covered_files) + len(operations),
+            unit="entries",
+            metrics=dict(performance_metrics or {}),
         )
         retained_entries = [
             PlanOutputEntry(
@@ -127,16 +176,19 @@ def create_consolidation_plan(
             key=lambda entry: (entry.output_relative_path, entry.entry_kind)
         )
 
-        plan_id = str(uuid.uuid4())
-        run_output_root = run_path.parent.parent
-        intended_destination = str(
-            (run_output_root / "materialized" / run_id).resolve(strict=False)
-        )
+        intended_destination = str(row["materialized_destination"])
         require_outside_selected_root(
             Path(intended_destination), "Materialized Consolidation", selected_root
         )
 
         reporter.start("Persisting plan")
+        persisted_progress.phase(
+            "persisting-plan",
+            completed_count=0,
+            total_count=len(output_entries),
+            unit="entries",
+            metrics=dict(performance_metrics or {}),
+        )
         connection.execute("BEGIN IMMEDIATE")
         created_at = datetime.now(UTC).isoformat()
         connection.execute(
@@ -152,9 +204,9 @@ def create_consolidation_plan(
                 None,
             ),
         )
-        for index, operation in enumerate(operations):
-            connection.execute(
-                "INSERT INTO plan_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        connection.executemany(
+            "INSERT INTO plan_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
                 (
                     plan_id,
                     index,
@@ -167,11 +219,13 @@ def create_consolidation_plan(
                     operation.canonical_reason,
                     operation.modified_ns,
                     operation.evidence_kind,
-                ),
-            )
-        for index, entry in enumerate(output_entries):
-            connection.execute(
-                "INSERT INTO plan_output_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                for index, operation in enumerate(operations)
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO plan_output_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
                 (
                     plan_id,
                     index,
@@ -185,8 +239,10 @@ def create_consolidation_plan(
                     entry.reason,
                     entry.modified_ns,
                     entry.evidence_kind,
-                ),
-            )
+                )
+                for index, entry in enumerate(output_entries)
+            ),
+        )
         connection.executemany(
             "INSERT INTO plan_structural_roots VALUES (?, ?)",
             ((plan_id, root) for root in sorted(structural_roots)),
@@ -217,14 +273,25 @@ def create_consolidation_plan(
             conflict_rows,
         )
         persist_plan_projection(
-            connection, plan_id, run_id, structural_unions, conflict_groups
+            connection,
+            plan_id,
+            run_id,
+            structural_unions,
+            conflict_groups,
+            inventory_index,
         )
         initialize_layout_baseline(connection, plan_id)
         connection.commit()
+        persisted_progress.complete(metrics=dict(performance_metrics or {}))
         reporter.complete()
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
+        if persisted_progress is not None:
+            try:
+                persisted_progress.fail("plan derivation failed")
+            except sqlite3.Error:
+                pass
         raise
     finally:
         connection.close()
@@ -424,7 +491,10 @@ def override_canonical_copy(
 @run_workspace_refusal
 @_with_run_lock
 def finalize_consolidation_plan(
-    analysis_run: Path, plan_id: str | None = None, *, expected_revision: int | None = None
+    analysis_run: Path,
+    plan_id: str | None = None,
+    *,
+    expected_revision: int | None = None,
 ) -> dict[str, object]:
     """Explicitly freeze a draft plan's schema-versioned operations.
 

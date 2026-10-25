@@ -6,7 +6,7 @@ import sqlite3
 import stat
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import wraps
 from itertools import pairwise
@@ -26,17 +26,29 @@ from .exact_duplicate_groups import (
     READ_OUTCOME_SUCCESSFUL,
     derive_exact_duplicate_groups,
 )
+from .linux_filesystem import LinuxFilesystemError, effective_filesystem_type
 from .progress import NullProgressReporter, ProgressReporter
 from .run_workspace import (
     DATABASE_NAME,
     SCHEMA_VERSION,
     RunWorkspaceError,
+    WorkspaceCapabilities,
+    admit_workspace_root,
     is_within,
+    nearest_existing_directory,
     open_wal_read_write,
     require_outside_selected_root,
     resolve_run_directory,
 )
-from .structural_relationships import analyze as analyze_structural_relationships
+from .structural_relationships import (
+    StructuralEvidenceProjection,
+    StructuralMetadata,
+    project_structural_evidence,
+)
+from .structural_relationships import (
+    analyze as analyze_structural_relationships,
+)
+from .workflow_progress import ensure_workflow_progress_schema
 
 __all__ = ["DATABASE_NAME", "SCHEMA_VERSION"]
 
@@ -44,6 +56,11 @@ BATCH_SIZE = 500
 DIRECTORY_EVIDENCE_VERSION = 1
 DIRECTORY_EVIDENCE_SCHEMA_VERSION = 4
 STRUCTURAL_RELATIONSHIPS_SCHEMA_VERSION = 9
+_WORKSPACE_BASE_BYTES = 16 * 1024 * 1024
+_WORKSPACE_ENTRY_BYTES = 512
+_WORKSPACE_SAFETY_NUMERATOR = 6
+_WORKSPACE_SAFETY_DENOMINATOR = 5
+_WORKSPACE_PEAK_AUXILIARY_BYTES = 16 * 1024 * 1024
 
 
 class AnalysisRunError(Exception):
@@ -78,6 +95,38 @@ class InventoryEntry:
     file_observation: FileObservation | None = None
 
 
+@dataclass(frozen=True)
+class MetadataAdmission:
+    destination: str
+    destination_filesystem_type: str
+    destination_file_size_bits: int
+    destination_max_file_size: int
+    destination_name_max: int
+    destination_path_max: int
+    destination_name_incompatibility_count: int
+    destination_path_incompatibility_count: int
+    observed_file_count: int
+    total_observed_bytes: int
+    minimum_required_bytes: int
+    free_bytes: int
+    inaccessible_entry_count: int
+
+
+@dataclass(frozen=True)
+class WorkspaceAdmission:
+    workspace_root: str
+    workspace_filesystem_type: str
+    workspace_file_size_bits: int
+    workspace_max_file_size: int | None
+    projected_structural_rows: int
+    projected_structural_indexed_text_bytes: int
+    estimated_database_bytes: int
+    required_single_file_capacity: int
+    estimated_peak_workspace_bytes: int
+    free_bytes: int
+    sizing_basis: str
+
+
 def _resolved_directory(path: Path, label: str) -> Path:
     try:
         resolved = path.expanduser().resolve(strict=True)
@@ -88,6 +137,221 @@ def _resolved_directory(path: Path, label: str) -> Path:
     return resolved
 
 
+def resolve_materialized_destination(
+    output_root: Path, run_id: str, destination: Path | None = None
+) -> Path:
+    """Resolve one exact destination for an Analysis Run before admission."""
+    resolved_output_root = output_root.expanduser().resolve(strict=False)
+    resolved_destination = (
+        destination.expanduser().resolve(strict=False)
+        if destination is not None
+        else (resolved_output_root / "materialized" / run_id).resolve(strict=False)
+    )
+    if resolved_destination == resolved_output_root:
+        raise AnalysisRunError(
+            "Run Output Root must not equal the exact Materialized Consolidation "
+            f"destination: {resolved_output_root}"
+        )
+    return resolved_destination
+
+
+def _destination_filesystem_type(path: Path) -> str:
+    """Translate the shared Linux filesystem probe into this domain's refusal."""
+    try:
+        return effective_filesystem_type(path)
+    except LinuxFilesystemError as error:
+        raise AnalysisRunError("cannot inspect destination filesystem type") from error
+
+
+def _destination_max_file_size(path: Path) -> tuple[str, int]:
+    filesystem_type = _destination_filesystem_type(path)
+    try:
+        bits = int(os.pathconf(path, "PC_FILESIZEBITS"))
+    except (OSError, ValueError) as error:
+        raise AnalysisRunError(
+            f"cannot determine destination maximum supported file size: {path}"
+        ) from error
+    if bits <= 0:
+        raise AnalysisRunError(
+            f"invalid destination file-size capability ({bits} bits): {path}"
+        )
+    return filesystem_type, (1 << bits) - 1
+
+
+def _admit_metadata_inventory(
+    entries: list[InventoryEntry], destination: Path
+) -> MetadataAdmission:
+    """Reject only destination blockers proven by the reusable metadata inventory."""
+    resolved_destination = destination.expanduser().resolve(strict=False)
+    parent = nearest_existing_directory(
+        resolved_destination.parent, "Materialized Consolidation destination"
+    )
+    filesystem_type, maximum_file_size = _destination_max_file_size(parent)
+    file_size_bits = maximum_file_size.bit_length()
+    try:
+        name_max = int(os.pathconf(parent, "PC_NAME_MAX"))
+        path_max = int(os.pathconf(parent, "PC_PATH_MAX"))
+        free_bytes = int(shutil.disk_usage(parent).free)
+    except (OSError, ValueError) as error:
+        raise AnalysisRunError(
+            f"cannot inspect destination metadata limits: {parent}"
+        ) from error
+
+    files = [
+        entry
+        for entry in entries
+        if entry.kind == "regular-file"
+        and entry.read_outcome == READ_OUTCOME_SUCCESSFUL
+    ]
+    sizes = [int(entry.observed_byte_size or 0) for entry in files]
+    relative_paths = [
+        entry.relative_path for entry in entries if entry.relative_path != "."
+    ]
+    incompatible_names = sum(
+        any(len(os.fsencode(part)) > name_max for part in Path(path).parts)
+        for path in relative_paths
+    )
+    incompatible_paths = sum(
+        len(os.fsencode(resolved_destination / path)) > path_max
+        for path in relative_paths
+    )
+    oversized = next(
+        (
+            entry
+            for entry in files
+            if int(entry.observed_byte_size or 0) > maximum_file_size
+        ),
+        None,
+    )
+    if oversized is not None:
+        raise AnalysisRunError(
+            "destination maximum supported file size is smaller than source file "
+            f"{oversized.relative_path!r} ({oversized.observed_byte_size} > "
+            f"{maximum_file_size} bytes on {filesystem_type})"
+        )
+
+    # Equal-size files might prove identical later, so one file per distinct size
+    # is the strongest safe lower bound available without reading payloads.
+    minimum_required_bytes = sum(set(sizes))
+    if minimum_required_bytes > free_bytes:
+        raise AnalysisRunError(
+            "insufficient free space at destination even under best-case exact "
+            f"deduplication: {free_bytes} bytes free, at least "
+            f"{minimum_required_bytes} bytes required"
+        )
+
+    return MetadataAdmission(
+        destination=str(resolved_destination),
+        destination_filesystem_type=filesystem_type,
+        destination_file_size_bits=file_size_bits,
+        destination_max_file_size=maximum_file_size,
+        destination_name_max=name_max,
+        destination_path_max=path_max,
+        destination_name_incompatibility_count=incompatible_names,
+        destination_path_incompatibility_count=incompatible_paths,
+        observed_file_count=len(files),
+        total_observed_bytes=sum(sizes),
+        minimum_required_bytes=minimum_required_bytes,
+        free_bytes=free_bytes,
+        inaccessible_entry_count=sum(
+            entry.read_outcome != READ_OUTCOME_SUCCESSFUL for entry in entries
+        ),
+    )
+
+
+def _project_workspace_requirement(
+    entries: list[InventoryEntry], capabilities: WorkspaceCapabilities
+) -> WorkspaceAdmission:
+    structural: StructuralEvidenceProjection = project_structural_evidence(
+        [
+            StructuralMetadata(
+                relative_path=entry.relative_path,
+                entry_kind=entry.kind,
+                read_outcome=entry.read_outcome,
+                observed_byte_size=entry.observed_byte_size,
+                is_empty=entry.is_empty,
+            )
+            for entry in entries
+        ]
+    )
+    encoded_path_bytes = sum(
+        len(entry.relative_path.encode("utf-8")) for entry in entries
+    )
+    estimated_database_bytes = (
+        _WORKSPACE_BASE_BYTES
+        + (_WORKSPACE_ENTRY_BYTES * len(entries))
+        + (6 * encoded_path_bytes)
+        + structural.estimated_storage_bytes
+    )
+    required_single_file_capacity = (
+        estimated_database_bytes * _WORKSPACE_SAFETY_NUMERATOR
+        + _WORKSPACE_SAFETY_DENOMINATOR
+        - 1
+    ) // _WORKSPACE_SAFETY_DENOMINATOR
+    estimated_peak_workspace_bytes = (
+        2 * required_single_file_capacity + _WORKSPACE_PEAK_AUXILIARY_BYTES
+    )
+    return WorkspaceAdmission(
+        workspace_root=capabilities.root,
+        workspace_filesystem_type=capabilities.filesystem_type,
+        workspace_file_size_bits=capabilities.file_size_bits,
+        workspace_max_file_size=capabilities.maximum_file_size,
+        projected_structural_rows=structural.row_count,
+        projected_structural_indexed_text_bytes=structural.indexed_text_bytes,
+        estimated_database_bytes=estimated_database_bytes,
+        required_single_file_capacity=required_single_file_capacity,
+        estimated_peak_workspace_bytes=estimated_peak_workspace_bytes,
+        free_bytes=int(
+            shutil.disk_usage(
+                nearest_existing_directory(
+                    Path(capabilities.root), "Run Workspace Root"
+                )
+            ).free
+        ),
+        sizing_basis=(
+            "schema/path estimate with measured 1000-byte structural-row floor, "
+            "20% single-file safety margin, and DB+WAL peak"
+        ),
+    )
+
+
+def _admit_workspace_inventory(
+    entries: list[InventoryEntry], capabilities: WorkspaceCapabilities
+) -> WorkspaceAdmission:
+    """Apply an estimate-based supported-capacity policy before content hashing."""
+    admission = _project_workspace_requirement(entries, capabilities)
+    facts = (
+        f"workspace filesystem {admission.workspace_filesystem_type}, "
+        "maximum single-file size "
+        f"{admission.workspace_max_file_size if admission.workspace_max_file_size is not None else 'unknown'}"
+        f" bytes, file-size capability {admission.workspace_file_size_bits} bits, "
+        f"projected structural rows {admission.projected_structural_rows}, "
+        f"estimated database size {admission.estimated_database_bytes} bytes, "
+        f"supported single-file requirement {admission.required_single_file_capacity} bytes, "
+        f"estimated peak workspace {admission.estimated_peak_workspace_bytes} bytes, "
+        f"available free space {admission.free_bytes} bytes"
+    )
+    remediation = (
+        "; use --workspace-root on a filesystem supporting larger files and "
+        "sufficient free space"
+    )
+    if (
+        admission.workspace_max_file_size is not None
+        and admission.required_single_file_capacity > admission.workspace_max_file_size
+    ):
+        raise AnalysisRunError(
+            "Run Workspace capacity refused before hashing because the estimated "
+            f"SQLite database exceeds the supported per-file envelope ({facts})"
+            f"{remediation}"
+        )
+    if admission.estimated_peak_workspace_bytes > admission.free_bytes:
+        raise AnalysisRunError(
+            "Run Workspace capacity refused before hashing because the estimated "
+            f"DB/WAL peak exceeds available space ({facts}){remediation}"
+        )
+    return admission
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -96,12 +360,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
           snapshot_id TEXT NOT NULL UNIQUE,
           schema_version INTEGER NOT NULL,
           selected_backup_root TEXT NOT NULL,
+          materialized_destination TEXT NOT NULL,
           status TEXT NOT NULL,
           started_at TEXT NOT NULL,
           completed_at TEXT,
           writer_lease TEXT,
           checkpoint_relative_path TEXT,
           hash_checkpoint_relative_path TEXT
+        );
+
+        CREATE TABLE analysis_run_execution_intent (
+          run_id TEXT PRIMARY KEY,
+          execution_mode TEXT NOT NULL CHECK (execution_mode IN ('source-preserving', 'in-place')),
+          executor_kind TEXT NOT NULL CHECK (executor_kind IN ('source-preserving', 'hard-link-protection', 'rename-protection')),
+          executor_version INTEGER NOT NULL CHECK (executor_version >= 1),
+          admission_version INTEGER NOT NULL CHECK (admission_version >= 1),
+          admitted_at TEXT NOT NULL,
+          FOREIGN KEY (run_id) REFERENCES analysis_runs(run_id)
         );
 
         CREATE TABLE inventory_entries (
@@ -223,6 +498,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_workflow_progress_schema(connection)
 
 
 def _collect_entries(root: Path) -> list[InventoryEntry]:
@@ -423,6 +699,7 @@ def _run_scan_batches(
     selected_root: Path,
     resume_after: str | None,
     progress: ProgressReporter,
+    entries: list[InventoryEntry] | None = None,
 ) -> None:
     """Insert observations in bounded, checkpointed, atomic batches.
 
@@ -430,7 +707,7 @@ def _run_scan_batches(
     Findings, and the advanced checkpoint together. An interruption between
     batches leaves only the prior, already-committed checkpoint durable.
     """
-    entries = _collect_entries(selected_root)
+    entries = _collect_entries(selected_root) if entries is None else entries
     if resume_after is not None:
         entries = [entry for entry in entries if entry.relative_path > resume_after]
 
@@ -746,7 +1023,15 @@ def create_analysis_run(
     selected_backup_root: Path,
     output_root: Path,
     *,
+    workspace_root: Path | None = None,
+    destination: Path | None = None,
+    run_id: str | None = None,
     progress: ProgressReporter | None = None,
+    execution_mode: str = "source-preserving",
+    executor_kind: str = "source-preserving",
+    executor_version: int = 1,
+    execution_admission_version: int = 1,
+    execution_admitted_at: str | None = None,
 ) -> dict[str, object]:
     reporter = progress or NullProgressReporter()
     selected_root = _resolved_directory(selected_backup_root, "Selected Backup Root")
@@ -754,13 +1039,44 @@ def create_analysis_run(
     require_outside_selected_root(
         resolved_output_root, "Run Output Root", selected_root
     )
-
-    run_id = str(uuid.uuid4())
-    snapshot_id = str(uuid.uuid4())
-    analysis_run = (resolved_output_root / "runs" / run_id).resolve(strict=False)
-    if not is_within(analysis_run, resolved_output_root):
+    resolved_workspace_root = (
+        workspace_root.expanduser().resolve(strict=False)
+        if workspace_root is not None
+        else resolved_output_root
+    )
+    reporter.start("Run Workspace capability admission")
+    workspace_capabilities = admit_workspace_root(
+        resolved_workspace_root, selected_root
+    )
+    reporter.complete()
+    run_id = run_id or str(uuid.uuid4())
+    resolved_destination = resolve_materialized_destination(
+        resolved_output_root, run_id, destination
+    )
+    require_outside_selected_root(
+        resolved_destination, "Materialized Consolidation", selected_root
+    )
+    if resolved_workspace_root == resolved_destination:
         raise AnalysisRunError(
-            f"Analysis Run must remain under the Run Output Root: {analysis_run}"
+            "Run Workspace Root must not equal the exact Materialized Consolidation "
+            f"destination: {resolved_workspace_root}"
+        )
+
+    reporter.start("Collecting metadata")
+    entries = _collect_entries(selected_root)
+    reporter.complete()
+    reporter.start("Metadata admission")
+    metadata_admission = _admit_metadata_inventory(entries, resolved_destination)
+    reporter.complete()
+    reporter.start("Run Workspace capacity admission")
+    workspace_admission = _admit_workspace_inventory(entries, workspace_capabilities)
+    reporter.complete()
+
+    snapshot_id = str(uuid.uuid4())
+    analysis_run = (resolved_workspace_root / "runs" / run_id).resolve(strict=False)
+    if not is_within(analysis_run, resolved_workspace_root):
+        raise AnalysisRunError(
+            f"Analysis Run must remain under the Run Workspace Root: {analysis_run}"
         )
     require_outside_selected_root(analysis_run, "Analysis Run", selected_root)
 
@@ -777,19 +1093,43 @@ def create_analysis_run(
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             "INSERT INTO analysis_runs VALUES "
-            "(?, ?, ?, ?, 'scanning', ?, NULL, ?, NULL, NULL)",
-            (run_id, snapshot_id, SCHEMA_VERSION, str(selected_root), now, lease_token),
+            "(?, ?, ?, ?, ?, 'scanning', ?, NULL, ?, NULL, NULL)",
+            (
+                run_id,
+                snapshot_id,
+                SCHEMA_VERSION,
+                str(selected_root),
+                str(resolved_destination),
+                now,
+                lease_token,
+            ),
         )
         connection.execute(
             "INSERT INTO evidence_discovery_progress (run_id, phase) "
             "VALUES (?, 'inventory')",
             (run_id,),
         )
+        connection.execute(
+            "INSERT INTO analysis_run_execution_intent VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                execution_mode,
+                executor_kind,
+                executor_version,
+                execution_admission_version,
+                execution_admitted_at or now,
+            ),
+        )
         connection.commit()
         run_initialized = True
 
         _run_scan_batches(
-            connection, run_id, selected_root, resume_after=None, progress=reporter
+            connection,
+            run_id,
+            selected_root,
+            resume_after=None,
+            progress=reporter,
+            entries=entries,
         )
 
         connection.execute("BEGIN IMMEDIATE")
@@ -851,11 +1191,19 @@ def create_analysis_run(
     return {
         "analysis_run": str(analysis_run),
         "inventory_count": inventory_count,
+        "materialized_destination": str(resolved_destination),
+        "metadata_admission": asdict(metadata_admission),
+        "run_output_root": str(resolved_output_root),
         "run_id": run_id,
+        "run_workspace_root": str(resolved_workspace_root),
         "selected_backup_root": str(selected_root),
         "skipped_count": skipped_count,
         "snapshot_id": snapshot_id,
         "status": "complete",
+        "execution_mode": execution_mode,
+        "executor_kind": executor_kind,
+        "executor_version": executor_version,
+        "workspace_admission": asdict(workspace_admission),
     }
 
 
@@ -968,7 +1316,9 @@ def resume_analysis_run(
     return {
         "analysis_run": str(run_path),
         "inventory_count": inventory_count,
+        "materialized_destination": row["materialized_destination"],
         "run_id": run_id,
+        "run_workspace_root": str(run_path.parent.parent),
         "selected_backup_root": row["selected_backup_root"],
         "skipped_count": skipped_count,
         "snapshot_id": row["snapshot_id"],

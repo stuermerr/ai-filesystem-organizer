@@ -7,6 +7,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_SCRIPT = PROJECT_ROOT / "scripts" / "benchmark_example_fixture.py"
+MATERIALIZATION_BENCHMARK_SCRIPT = (
+    PROJECT_ROOT / "scripts" / "benchmark_materialization.py"
+)
 
 
 def test_example_fixture_benchmark_records_fresh_complete_workflow(
@@ -48,7 +51,8 @@ def test_example_fixture_benchmark_records_fresh_complete_workflow(
     assert result["median"]["total_seconds"] > 0
     assert result["median"]["source_files"] > 0
     assert result["median"]["source_bytes"] > 0
-    assert result["median"]["database_bytes"] > 0
+    assert result["median"]["database_bytes"] == 0
+    assert result["median"]["database_bytes_before_cleanup"] > 0
     assert result["median"]["inventory_entries"] > 0
     assert result["median"]["successful_identity_rows"] > 0
     assert result["median"]["successful_identity_bytes"] > 0
@@ -67,8 +71,7 @@ def test_example_fixture_benchmark_records_fresh_complete_workflow(
     assert result["median"]["materialization_journal_rows"] >= 0
     assert result["median"]["execution_evidence_rows"] > 0
     assert (
-        result["median"]["cloned_file_count"]
-        + result["median"]["streamed_file_count"]
+        result["median"]["cloned_file_count"] + result["median"]["streamed_file_count"]
         == result["median"]["materialized_files"]
     )
     assert set(result["runs"][0]["stages"]) == {
@@ -85,3 +88,47 @@ def test_example_fixture_benchmark_records_fresh_complete_workflow(
     history = json.loads(history_path.read_text(encoding="utf-8"))
     assert history["schema_version"] == 1
     assert history["benchmarks"] == [result]
+
+
+def test_materialization_benchmark_smoke_and_repetition_contract() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(MATERIALIZATION_BENCHMARK_SCRIPT),
+            "--checkout",
+            str(PROJECT_ROOT),
+            "--files",
+            "2",
+            "--repetitions",
+            "3",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["scenario"] == "fresh"
+    assert len(result["runs"]) == 3
+    run = result["runs"][0]
+    assert run["revision"]
+    assert run["filesystem"]
+    assert run["mount_options"]
+    assert run["output_bytes"] == 8192
+    assert run["telemetry"]["phase"] == "complete"
+
+    refused = subprocess.run(
+        [
+            sys.executable,
+            str(MATERIALIZATION_BENCHMARK_SCRIPT),
+            "--repetitions",
+            "2",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert refused.returncode == 2
+    assert "at least three repetitions" in refused.stderr

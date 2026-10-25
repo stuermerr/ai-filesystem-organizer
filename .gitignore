@@ -1,14 +1,28 @@
 docs/*
+!docs/releases/
+docs/releases/*
+!docs/releases/0.1.0-scope.md
+!docs/releases/0.1.0-implementation-plan.md
 !docs/adr/
 docs/adr/*
 !docs/adr/0004-proof-driven-content-identity.md
 !docs/adr/0005-phase-level-source-preserving-materialization.md
+!docs/adr/0010-metadata-first-rename-protection-v2.md
+!docs/benchmarks/
+docs/benchmarks/*
+!docs/benchmarks/issue-139-materialization.md
+!docs/benchmarks/issue-151-rename-protection-v2.md
+testdrive/
 .codegraph/
+graphify-out/
 .opencode/
 __pycache__/
 .mypy_cache/
 .tmp/
+testdir_output/
+testdir-output-v2/
 output/
+.organizer-runs/
 *.egg-info/
 dist/
 build/
@@ -19,3 +33,4 @@ build/
 # Markdown files
 IDEAS.md
 Intermediate-Project-Report.md
+testdir-structure-overview.md

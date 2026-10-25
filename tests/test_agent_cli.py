@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from filesystem_organizer.run_workspace import SCHEMA_VERSION
 from tests.test_cli import PROJECT_ROOT, run_cli, tree_digest
 
 
@@ -38,6 +39,7 @@ def test_runs_reports_an_empty_default_run_output_root(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
         "run_output_root": str((tmp_path / "output").resolve()),
+        "run_workspace_root": str((tmp_path / "output").resolve()),
         "runs": [],
     }
     assert result.stderr == ""
@@ -57,6 +59,52 @@ def test_runs_reports_exactly_one_run(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert len(json.loads(result.stdout)["runs"]) == 1
     assert json.loads(result.stdout)["runs"][0]["run_id"] == scan_result["run_id"]
+
+
+def test_separate_workspace_discovery_status_and_resume_use_returned_run_path(
+    tmp_path: Path,
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "one.txt").write_text("one")
+    output_root = tmp_path / "output"
+    workspace_root = tmp_path / "workspace"
+    scan = run_cli(
+        tmp_path,
+        "scan",
+        str(selected_root),
+        "--output-root",
+        str(output_root),
+        "--workspace-root",
+        str(workspace_root),
+    )
+    assert scan.returncode == 0, scan.stderr
+    scan_result = json.loads(scan.stdout)
+    run_path = Path(scan_result["analysis_run"])
+    with sqlite3.connect(run_path / "analysis.sqlite3") as connection:
+        connection.execute(
+            "UPDATE analysis_runs SET status = 'scanning', completed_at = NULL, "
+            "writer_lease = NULL"
+        )
+
+    discovered = run_cli(tmp_path, "runs", "--workspace-root", str(workspace_root))
+    assert discovered.returncode == 0, discovered.stderr
+    discovered_payload = json.loads(discovered.stdout)
+    assert discovered_payload["run_workspace_root"] == str(workspace_root.resolve())
+    assert "run_output_root" not in discovered_payload
+    assert discovered_payload["runs"][0]["analysis_run"] == str(run_path)
+
+    status = run_cli(tmp_path, "status", str(run_path))
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["recovery_available"] is True
+
+    resumed = run_cli(tmp_path, "resume", str(run_path))
+    assert resumed.returncode == 0, resumed.stderr
+    resumed_payload = json.loads(resumed.stdout)
+    assert resumed_payload["run_workspace_root"] == str(workspace_root.resolve())
+    assert resumed_payload["materialized_destination"] == str(
+        output_root.resolve() / "materialized" / scan_result["run_id"]
+    )
 
 
 def test_runs_discovers_complete_and_incomplete_runs_deterministically(
@@ -93,6 +141,7 @@ def test_runs_discovers_complete_and_incomplete_runs_deterministically(
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["run_output_root"] == str(output_root.resolve())
+    assert payload["run_workspace_root"] == str(output_root.resolve())
     assert payload["runs"] == sorted(
         payload["runs"], key=lambda run: run["analysis_run"]
     )
@@ -105,6 +154,7 @@ def test_runs_discovers_complete_and_incomplete_runs_deterministically(
             "analysis_run",
             "completed_at",
             "run_id",
+            "run_workspace_root",
             "selected_backup_root",
             "snapshot_id",
             "started_at",
@@ -207,20 +257,53 @@ def test_status_reports_complete_run_without_plans_read_only(tmp_path: Path) -> 
         "completed_at": payload["completed_at"],
         "hash_checkpoint_relative_path": None,
         "inventory_count": 1,
+        "execution_intent": {
+            "execution_mode": "source-preserving",
+            "executor_kind": "source-preserving",
+            "executor_version": 1,
+            "admission_version": 1,
+            "admitted_at": payload["execution_intent"]["admitted_at"],
+        },
         "plans": [],
         "recovery_available": False,
         "run_id": scan_result["run_id"],
-        "schema_version": 10,
+        "run_workspace_root": str((tmp_path / "output").resolve()),
+        "schema_version": SCHEMA_VERSION,
         "selected_backup_root": str(selected_root.resolve()),
         "skipped_entry_finding_count": 1,
         "snapshot_id": scan_result["snapshot_id"],
         "started_at": payload["started_at"],
         "status": "complete",
         "writer_active": False,
+        "workflow_progress": {"active": [], "recent": []},
     }
     assert payload["completed_at"]
     assert payload["started_at"]
     assert database_path.read_bytes() == before
+
+
+def test_status_exposes_recent_plan_progress_without_using_it_as_authority(
+    tmp_path: Path,
+) -> None:
+    selected_root = tmp_path / "backup"
+    selected_root.mkdir()
+    (selected_root / "one.txt").write_text("one")
+    scan = run_cli(tmp_path, "scan", str(selected_root))
+    run_path = Path(json.loads(scan.stdout)["analysis_run"])
+
+    plan = run_cli(tmp_path, "plan", str(run_path))
+    assert plan.returncode == 0, plan.stderr
+    status = run_cli(tmp_path, "status", str(run_path))
+
+    assert status.returncode == 0, status.stderr
+    progress = json.loads(status.stdout)["workflow_progress"]
+    assert progress["active"] == []
+    recent = progress["recent"][0]
+    assert recent["operation_kind"] == "plan-derivation"
+    assert recent["state"] == "complete"
+    assert recent["phase"] == "complete"
+    assert recent["plan_id"] == json.loads(plan.stdout)["plan_id"]
+    assert recent["percentage"] == 100.0
 
 
 def test_status_refuses_missing_malformed_unsupported_and_ambiguous_runs(
@@ -251,12 +334,16 @@ def test_status_refuses_missing_malformed_unsupported_and_ambiguous_runs(
     assert "Unsupported Analysis Run schema version 999" in unsupported.stderr
 
     with sqlite3.connect(database_path) as connection:
-        connection.execute("UPDATE analysis_runs SET schema_version = 10")
+        connection.execute(
+            "UPDATE analysis_runs SET schema_version = ?", (SCHEMA_VERSION,)
+        )
         connection.execute(
             "INSERT INTO analysis_runs VALUES "
-            "('other-run', 'other-snapshot', 10, ?, 'complete', ?, ?, NULL, NULL, NULL)",
+            "('other-run', 'other-snapshot', ?, ?, ?, 'complete', ?, ?, NULL, NULL, NULL)",
             (
+                SCHEMA_VERSION,
                 str(selected_root.resolve()),
+                str((tmp_path / "other-result").resolve()),
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
             ),
@@ -287,14 +374,14 @@ def test_status_reports_plan_lifecycle_and_materialization_recovery_state(
         first["plan_id"],
     )
     assert finalized.returncode == 0, finalized.stderr
+    second_plan = run_cli(tmp_path, "plan", str(run_path))
+    assert second_plan.returncode == 0, second_plan.stderr
+    second = json.loads(second_plan.stdout)
     materialized = run_cli(
         tmp_path, "materialize", str(run_path), first["plan_id"], "--yes"
     )
     assert materialized.returncode == 0, materialized.stderr
-
-    second_plan = run_cli(tmp_path, "plan", str(run_path))
-    assert second_plan.returncode == 0, second_plan.stderr
-    second = json.loads(second_plan.stdout)
+    assert json.loads(materialized.stdout)["workspace_cleanup"] == "preserved"
 
     result = run_cli(tmp_path, "status", str(run_path))
 
@@ -318,6 +405,7 @@ def test_status_reports_plan_lifecycle_and_materialization_recovery_state(
         "intended_destination": second["intended_destination"],
         "materialization_status": "not-started",
         "plan_id": second["plan_id"],
+        "recovery": None,
         "recovery_available": False,
         "status": "draft",
     }
@@ -350,7 +438,9 @@ def test_materialize_preflight_emits_json_without_mutating_any_workspace(
     assert payload == {
         "analysis_run": str(run_path),
         "destination": str(destination),
-        "explicit_directory_count": 0,
+            "explicit_directory_count": 0,
+            "executor_kind": "source-preserving",
+            "executor_version": 1,
         "free_bytes": payload["free_bytes"],
         "operation_count": 1,
         "plan_id": plan_id,

@@ -12,12 +12,14 @@ from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any, NamedTuple, cast
 
+from ..linux_filesystem import LinuxFilesystemError, nonblocking_lock
 from ..run_workspace import (
     open_read_only,
     open_wal_read_write,
     resolve_run_directory,
     select_plan_row,
 )
+from ..workflow_progress import WorkflowProgress
 from .models import PLAN_STATUS_DRAFT, ConsolidationPlanError, run_workspace_refusal
 
 LAYOUT_SCHEMA_VERSION = 2
@@ -71,9 +73,13 @@ class _ObservedConnection(sqlite3.Connection):
     metrics: dict[str, int]
 
     def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+        if hasattr(self, "metrics"):
+            self.metrics["sqlite_statements"] += 1
         return self.cursor(factory=_ObservedCursor).execute(sql, parameters)
 
     def executemany(self, sql: str, parameters: Iterable[Any]) -> sqlite3.Cursor:
+        if hasattr(self, "metrics"):
+            self.metrics["sqlite_statements"] += 1
         return self.cursor(factory=_ObservedCursor).executemany(sql, parameters)
 
 
@@ -381,7 +387,8 @@ def initialize_layout_baseline(connection: sqlite3.Connection, plan_id: str) -> 
         )
         if len(pending) == 10_000:
             connection.executemany(
-                "INSERT INTO plan_baseline_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", pending
+                "INSERT INTO plan_baseline_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                pending,
             )
             pending.clear()
     connection.executemany(
@@ -484,7 +491,7 @@ def _path(value: object, field: str, findings: list[dict[str, object]]) -> str |
             )
         )
         return None
-    if value == _STAGING_NAMESPACE or value.startswith(_STAGING_NAMESPACE + "/"):
+    if value.startswith(_STAGING_NAMESPACE):
         findings.append(
             _finding(
                 "reserved-path",
@@ -830,7 +837,7 @@ def _validate_occupancy(
     findings: list[dict[str, object]],
 ) -> None:
     affected = {_entry_id(entry.baseline) for entry in resolved}
-    candidates: dict[str, ResolvedLayoutEntry] = {}
+    candidate_rows: list[tuple[str, str, str]] = []
     for entry in resolved:
         target = entry.output_relative_path
         if entry.disposition == "exclude" or target is None:
@@ -844,113 +851,188 @@ def _validate_occupancy(
                     path=target,
                 )
             )
-        if target in candidates and _entry_id(candidates[target].baseline) != _entry_id(
-            entry.baseline
-        ):
+        candidate_rows.append(
+            (target, _entry_id(entry.baseline), str(entry.baseline["entry_kind"]))
+        )
+
+    connection.executescript(
+        "DROP TABLE IF EXISTS temp.layout_affected;"
+        "DROP TABLE IF EXISTS temp.layout_candidates;"
+        "DROP TABLE IF EXISTS temp.layout_directories;"
+        "DROP TABLE IF EXISTS temp.layout_candidate_ancestors;"
+        "DROP TABLE IF EXISTS temp.layout_directory_ancestors;"
+        "CREATE TEMP TABLE layout_affected(entry_id TEXT PRIMARY KEY) WITHOUT ROWID;"
+        "CREATE TEMP TABLE layout_candidates(path TEXT NOT NULL, entry_id TEXT NOT NULL, "
+        "entry_kind TEXT NOT NULL, PRIMARY KEY(path, entry_id)) WITHOUT ROWID;"
+        "CREATE INDEX layout_candidate_entry_kind ON layout_candidates(entry_kind, path);"
+        "CREATE TEMP TABLE layout_directories(path TEXT PRIMARY KEY) WITHOUT ROWID;"
+        "CREATE TEMP TABLE layout_candidate_ancestors(target TEXT NOT NULL, path TEXT NOT NULL, "
+        "PRIMARY KEY(target, path)) WITHOUT ROWID;"
+        "CREATE INDEX layout_candidate_ancestor_path ON layout_candidate_ancestors(path, target);"
+        "CREATE TEMP TABLE layout_directory_ancestors(target TEXT NOT NULL, path TEXT NOT NULL, "
+        "PRIMARY KEY(target, path)) WITHOUT ROWID;"
+        "CREATE INDEX layout_directory_ancestor_path ON layout_directory_ancestors(path, target);"
+    )
+    connection.executemany(
+        "INSERT INTO layout_affected VALUES(?)", ((entry_id,) for entry_id in affected)
+    )
+    connection.executemany(
+        "INSERT INTO layout_candidates VALUES(?,?,?)", candidate_rows
+    )
+    connection.executemany(
+        "INSERT INTO layout_directories VALUES(?)", ((path,) for path in directories)
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO layout_candidate_ancestors VALUES(?,?)",
+        (
+            (target, parent.as_posix())
+            for target, _entry_id_value, _kind in candidate_rows
+            for parent in PurePosixPath(target).parents
+            if parent.as_posix() != "."
+        ),
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO layout_directory_ancestors VALUES(?,?)",
+        (
+            (target, parent.as_posix())
+            for target in directories
+            for parent in PurePosixPath(target).parents
+            if parent.as_posix() != "."
+        ),
+    )
+    total_entries = int(
+        connection.execute(
+            "SELECT total_entry_count FROM plan_layout_state WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()[0]
+    )
+    has_unchanged_occupancy = len(affected) < total_entries
+
+    for row in connection.execute(
+        "SELECT path, COUNT(*) AS amount FROM layout_candidates GROUP BY path HAVING COUNT(*) > 1"
+    ):
+        for _ in range(int(row["amount"]) - 1):
             findings.append(
                 _finding(
                     "output-collision",
                     "Multiple baseline entries resolve to one output path",
-                    path=target,
+                    path=str(row["path"]),
                 )
             )
-        candidates[target] = entry
-    for target, entry in candidates.items():
-        occupant = connection.execute(
-            "SELECT entry_id FROM plan_layout_active_entries WHERE plan_id=? AND disposition='place' AND output_relative_path=?",
-            (plan_id, target),
-        ).fetchone()
-        if occupant is not None and str(occupant["entry_id"]) not in affected:
+    if has_unchanged_occupancy:
+        for row in connection.execute(
+            "SELECT DISTINCT candidate.path FROM layout_candidates AS candidate "
+            "CROSS JOIN plan_layout_active_entries AS active ON active.plan_id=? "
+            "AND active.disposition='place' AND active.output_relative_path=candidate.path "
+            "LEFT JOIN layout_affected AS affected ON affected.entry_id=active.entry_id "
+            "WHERE affected.entry_id IS NULL ORDER BY candidate.path",
+            (plan_id,),
+        ):
             findings.append(
                 _finding(
                     "output-collision",
                     "A changed entry collides with unchanged active occupancy",
-                    path=target,
+                    path=str(row["path"]),
                 )
             )
-        for parent in PurePosixPath(target).parents:
-            parent_path = parent.as_posix()
-            if parent_path == ".":
-                break
-            active_file = connection.execute(
-                "SELECT entry_id FROM plan_layout_active_entries WHERE plan_id=? AND disposition='place' AND entry_kind='file' AND output_relative_path=?",
-                (plan_id, parent_path),
-            ).fetchone()
-            candidate = candidates.get(parent_path)
-            if (
-                active_file is not None and str(active_file["entry_id"]) not in affected
-            ) or (candidate is not None and candidate.baseline["entry_kind"] == "file"):
-                findings.append(
-                    _finding(
-                        "file-directory-conflict",
-                        "A file is an ancestor of an output entry",
-                        path=target,
-                    )
-                )
-                break
-        if entry.baseline["entry_kind"] == "file":
-            if any(
-                directory == target or directory.startswith(target + "/")
-                for directory in directories
-            ):
-                findings.append(
-                    _finding(
-                        "file-directory-conflict",
-                        "A file conflicts with a proposed Layout-Owned Directory",
-                        path=target,
-                    )
-                )
-            descendants = connection.execute(
-                "SELECT entry_id FROM plan_layout_active_entries WHERE plan_id=? AND disposition='place' AND output_relative_path>=? AND output_relative_path<?",
-                (plan_id, target + "/", target + "0"),
-            ).fetchall()
-            if any(
-                str(descendant["entry_id"]) not in affected
-                for descendant in descendants
-            ):
-                findings.append(
-                    _finding(
-                        "file-directory-conflict",
-                        "A file is an ancestor of an unchanged output entry",
-                        path=target,
-                    )
-                )
-    for directory in directories:
-        occupant = connection.execute(
-            "SELECT entry_id, entry_kind FROM plan_layout_active_entries WHERE plan_id=? AND disposition='place' AND output_relative_path=?",
-            (plan_id, directory),
-        ).fetchone()
-        candidate = candidates.get(directory)
-        if (
-            occupant is not None
-            and occupant["entry_kind"] == "file"
-            and str(occupant["entry_id"]) not in affected
-        ) or (candidate is not None and candidate.baseline["entry_kind"] == "file"):
+
+    ancestor_targets = {
+        str(row["path"])
+        for row in connection.execute(
+            "SELECT DISTINCT ancestor.target AS path "
+            "FROM layout_candidate_ancestors AS ancestor JOIN layout_candidates AS parent "
+            "ON parent.path=ancestor.path AND parent.entry_kind='file' ORDER BY 1",
+        )
+    }
+    if has_unchanged_occupancy:
+        ancestor_targets.update(
+            str(row["path"])
+            for row in connection.execute(
+                "SELECT DISTINCT ancestor.target AS path FROM layout_candidate_ancestors AS ancestor "
+                "CROSS JOIN plan_layout_active_entries AS active ON active.plan_id=? "
+                "AND active.disposition='place' AND active.entry_kind='file' "
+                "AND active.output_relative_path=ancestor.path "
+                "LEFT JOIN layout_affected AS affected ON affected.entry_id=active.entry_id "
+                "WHERE affected.entry_id IS NULL",
+                (plan_id,),
+            )
+        )
+    for target in sorted(ancestor_targets):
+        findings.append(
+            _finding(
+                "file-directory-conflict",
+                "A file is an ancestor of an output entry",
+                path=target,
+            )
+        )
+
+    for row in connection.execute(
+        "SELECT DISTINCT candidate.path FROM layout_candidates AS candidate "
+        "JOIN layout_directories AS directory ON candidate.entry_kind='file' "
+        "AND (directory.path=candidate.path OR (directory.path>=candidate.path||'/' "
+        "AND directory.path<candidate.path||'0')) ORDER BY candidate.path"
+    ):
+        findings.append(
+            _finding(
+                "file-directory-conflict",
+                "A file conflicts with a proposed Layout-Owned Directory",
+                path=str(row["path"]),
+            )
+        )
+    if has_unchanged_occupancy:
+        for row in connection.execute(
+            "SELECT DISTINCT candidate.path FROM layout_candidates AS candidate "
+            "CROSS JOIN plan_layout_active_entries AS active ON active.plan_id=? "
+            "AND active.disposition='place' AND candidate.entry_kind='file' "
+            "AND active.output_relative_path>=candidate.path||'/' "
+            "AND active.output_relative_path<candidate.path||'0' "
+            "LEFT JOIN layout_affected AS affected ON affected.entry_id=active.entry_id "
+            "WHERE affected.entry_id IS NULL ORDER BY candidate.path",
+            (plan_id,),
+        ):
             findings.append(
                 _finding(
                     "file-directory-conflict",
-                    "A Layout-Owned Directory collides with a file",
-                    path=directory,
+                    "A file is an ancestor of an unchanged output entry",
+                    path=str(row["path"]),
                 )
             )
-        for parent in PurePosixPath(directory).parents:
-            parent_path = parent.as_posix()
-            if parent_path == ".":
-                break
-            active_file = connection.execute(
-                "SELECT entry_id FROM plan_layout_active_entries WHERE plan_id=? "
-                "AND disposition='place' AND entry_kind='file' AND output_relative_path=?",
-                (plan_id, parent_path),
-            ).fetchone()
-            if active_file is not None and str(active_file["entry_id"]) not in affected:
-                findings.append(
-                    _finding(
-                        "file-directory-conflict",
-                        "A file is an ancestor of a Layout-Owned Directory",
-                        path=directory,
-                    )
+
+    for row in connection.execute(
+        "SELECT DISTINCT directory.path FROM layout_directories AS directory "
+        "LEFT JOIN layout_candidates AS candidate ON candidate.path=directory.path "
+        "AND candidate.entry_kind='file' LEFT JOIN plan_layout_active_entries AS active "
+        "ON active.plan_id=? AND active.disposition='place' AND active.entry_kind='file' "
+        "AND active.output_relative_path=directory.path LEFT JOIN layout_affected AS affected "
+        "ON affected.entry_id=active.entry_id WHERE candidate.entry_id IS NOT NULL "
+        "OR (active.entry_id IS NOT NULL AND affected.entry_id IS NULL) ORDER BY directory.path",
+        (plan_id,),
+    ):
+        findings.append(
+            _finding(
+                "file-directory-conflict",
+                "A Layout-Owned Directory collides with a file",
+                path=str(row["path"]),
+            )
+        )
+    if has_unchanged_occupancy:
+        for row in connection.execute(
+            "SELECT DISTINCT directory.path FROM layout_directories AS directory "
+            "JOIN layout_directory_ancestors AS ancestor ON ancestor.target=directory.path "
+            "CROSS JOIN plan_layout_active_entries AS active ON active.plan_id=? "
+            "AND active.disposition='place' AND active.entry_kind='file' "
+            "AND active.output_relative_path=ancestor.path "
+            "LEFT JOIN layout_affected AS affected ON affected.entry_id=active.entry_id "
+            "WHERE affected.entry_id IS NULL ORDER BY directory.path",
+            (plan_id,),
+        ):
+            findings.append(
+                _finding(
+                    "file-directory-conflict",
+                    "A file is an ancestor of a Layout-Owned Directory",
+                    path=str(row["path"]),
                 )
-                break
+            )
 
 
 def _current_authoring(
@@ -990,7 +1072,10 @@ def _active_maps(
 
 
 def _compile(
-    connection: sqlite3.Connection, plan_id: str, layout_path: str
+    connection: sqlite3.Connection,
+    plan_id: str,
+    layout_path: str,
+    progress: WorkflowProgress | None = None,
 ) -> Compilation:
     started = perf_counter()
     state = connection.execute(
@@ -1023,7 +1108,11 @@ def _compile(
             [] if no_change else _affected_rows(connection, plan_id, current, layout)
         )
         affected_count = len(affected)
-        resolved = [_resolve(row, rules, exceptions) for row in affected]
+        resolved: list[ResolvedLayoutEntry] = []
+        for index, row in enumerate(affected, start=1):
+            resolved.append(_resolve(row, rules, exceptions))
+            if progress is not None:
+                progress.update(index)
         _validate_occupancy(connection, plan_id, resolved, directories, findings)
         affected_ids = {_entry_id(row) for row in affected}
         active_by_id: dict[str, sqlite3.Row] = {}
@@ -1187,8 +1276,7 @@ def _persist_rules(
     connection.executemany("INSERT INTO plan_layout_rules VALUES(?,?,?,?,?)", rows)
 
 
-@run_workspace_refusal
-def apply_layout(
+def _apply_layout_locked(
     analysis_run: Any,
     plan_id: str,
     layout_path: Any,
@@ -1207,10 +1295,12 @@ def apply_layout(
         ),
     )
     vm_samples = 0
+    persisted_progress: WorkflowProgress | None = None
     if performance_metrics is not None:
         assert isinstance(connection, _ObservedConnection)
         connection.metrics = performance_metrics
         performance_metrics["sqlite_rows_read"] = 0
+        performance_metrics["sqlite_statements"] = 0
         initial_changes = connection.total_changes
 
         def count_vm_steps() -> int:
@@ -1220,20 +1310,31 @@ def apply_layout(
 
         connection.set_progress_handler(count_vm_steps, 1000)
     try:
-        connection.execute("BEGIN IMMEDIATE")
         plan = select_plan_row(connection, plan_id)
         if plan["status"] != PLAN_STATUS_DRAFT:
             raise ConsolidationPlanError(
                 f"Consolidation Plan is not a draft: {plan_id}"
             )
-        compiled = _compile(connection, plan_id, str(layout_path))
+        state = connection.execute(
+            "SELECT total_entry_count FROM plan_layout_state WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        persisted_progress = WorkflowProgress(
+            connection,
+            "layout-apply",
+            str(plan["run_id"]),
+            plan_id=plan_id,
+            phase="compiling-layout",
+            total_count=int(state["total_entry_count"]),
+        )
+        compiled = _compile(connection, plan_id, str(layout_path), persisted_progress)
         result = compiled.validation
         if not result["valid"]:
             raise ConsolidationPlanError(
                 json.dumps(result, ensure_ascii=False, sort_keys=True)
             )
         if compiled.no_change:
-            connection.rollback()
+            persisted_progress.complete()
             return {
                 "analysis_run": str(run_path),
                 "revision": result["base_revision"],
@@ -1257,6 +1358,33 @@ def apply_layout(
             int(result["base_revision"]),
             int(result["base_revision"]) + 1,
         )
+        persisted_progress.phase(
+            "persisting-layout-revision",
+            completed_count=0,
+            total_count=int(result["changed_entry_count"]),
+            unit="entries",
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        authoritative_plan = select_plan_row(connection, plan_id)
+        authoritative_state = connection.execute(
+            "SELECT active_revision FROM plan_layout_state WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        authoritative_baseline = connection.execute(
+            "SELECT fingerprint FROM plan_baseline_metadata WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if authoritative_plan["status"] != PLAN_STATUS_DRAFT:
+            raise ConsolidationPlanError(
+                f"Consolidation Plan is not a draft: {plan_id}"
+            )
+        if (
+            authoritative_state is None
+            or int(authoritative_state["active_revision"]) != active
+        ):
+            raise ConsolidationPlanError("Layout base_revision is stale")
+        if authoritative_baseline is None or str(
+            authoritative_baseline["fingerprint"]
+        ) != str(result["baseline_fingerprint"]):
+            raise ConsolidationPlanError("Baseline Projection fingerprint is stale")
         assert compiled.layout is not None
         authoring = _canonical_authoring(
             compiled.layout, revision, str(result["baseline_fingerprint"])
@@ -1295,54 +1423,85 @@ def apply_layout(
                 for entry in compiled.changed_entries
             ],
         )
-        connection.executemany(
-            "UPDATE plan_layout_active_entries SET disposition='updating', output_relative_path=NULL "
-            "WHERE plan_id=? AND entry_id=?",
-            [
-                (plan_id, _entry_id(entry.baseline))
-                for entry in compiled.changed_entries
-            ],
+        connection.execute("DROP TABLE IF EXISTS temp.layout_changes")
+        connection.execute(
+            "CREATE TEMP TABLE layout_changes(entry_id TEXT PRIMARY KEY, "
+            "disposition TEXT NOT NULL, output_relative_path TEXT) WITHOUT ROWID"
         )
-        for entry in compiled.changed_entries:
-            connection.execute(
-                "UPDATE plan_layout_active_entries SET disposition=?, output_relative_path=? WHERE plan_id=? AND entry_id=?",
+        connection.executemany(
+            "INSERT INTO layout_changes VALUES(?,?,?)",
+            (
                 (
+                    _entry_id(entry.baseline),
                     entry.disposition,
                     entry.output_relative_path,
-                    plan_id,
-                    _entry_id(entry.baseline),
-                ),
-            )
+                )
+                for entry in compiled.changed_entries
+            ),
+        )
+        # Release all changed occupancy first so swaps cannot trip the unique
+        # active-path index, then publish the new state in one set-based write.
+        connection.execute(
+            "UPDATE plan_layout_active_entries SET disposition='updating', "
+            "output_relative_path=NULL WHERE plan_id=? AND entry_id IN "
+            "(SELECT entry_id FROM layout_changes)",
+            (plan_id,),
+        )
+        connection.execute(
+            "UPDATE plan_layout_active_entries SET "
+            "disposition=(SELECT disposition FROM layout_changes WHERE "
+            "layout_changes.entry_id=plan_layout_active_entries.entry_id), "
+            "output_relative_path=(SELECT output_relative_path FROM layout_changes WHERE "
+            "layout_changes.entry_id=plan_layout_active_entries.entry_id) "
+            "WHERE plan_id=? AND entry_id IN (SELECT entry_id FROM layout_changes)",
+            (plan_id,),
+        )
         connection.executemany(
             "INSERT INTO plan_layout_directory_deltas VALUES(?,?,?,?)",
             [(plan_id, revision, p, op) for p, op in compiled.directory_delta],
         )
-        for path, operation in compiled.directory_delta:
-            if operation == "add":
-                connection.execute(
-                    "INSERT INTO plan_layout_active_directories VALUES(?,?)",
-                    (plan_id, path),
-                )
-            else:
-                connection.execute(
-                    "DELETE FROM plan_layout_active_directories WHERE plan_id=? AND output_relative_path=?",
-                    (plan_id, path),
-                )
+        connection.execute("DROP TABLE IF EXISTS temp.layout_directory_changes")
+        connection.execute(
+            "CREATE TEMP TABLE layout_directory_changes(path TEXT PRIMARY KEY, "
+            "operation TEXT NOT NULL) WITHOUT ROWID"
+        )
+        connection.executemany(
+            "INSERT INTO layout_directory_changes VALUES(?,?)", compiled.directory_delta
+        )
+        connection.execute(
+            "DELETE FROM plan_layout_active_directories WHERE plan_id=? AND "
+            "output_relative_path IN (SELECT path FROM layout_directory_changes "
+            "WHERE operation='remove')",
+            (plan_id,),
+        )
+        connection.execute(
+            "INSERT INTO plan_layout_active_directories(plan_id, output_relative_path) "
+            "SELECT ?, path FROM layout_directory_changes WHERE operation='add'",
+            (plan_id,),
+        )
         connection.executemany(
             "INSERT INTO plan_layout_skipped_action_deltas VALUES(?,?,?,?)",
             [(plan_id, revision, p, a) for p, a in compiled.skipped_delta],
         )
-        for path, action in compiled.skipped_delta:
-            if action is None:
-                connection.execute(
-                    "DELETE FROM plan_layout_active_skipped_actions WHERE plan_id=? AND relative_path=?",
-                    (plan_id, path),
-                )
-            else:
-                connection.execute(
-                    "INSERT INTO plan_layout_active_skipped_actions VALUES(?,?,?) ON CONFLICT(plan_id,relative_path) DO UPDATE SET action=excluded.action",
-                    (plan_id, path, action),
-                )
+        connection.execute("DROP TABLE IF EXISTS temp.layout_skipped_changes")
+        connection.execute(
+            "CREATE TEMP TABLE layout_skipped_changes(path TEXT PRIMARY KEY, action TEXT) "
+            "WITHOUT ROWID"
+        )
+        connection.executemany(
+            "INSERT INTO layout_skipped_changes VALUES(?,?)", compiled.skipped_delta
+        )
+        connection.execute(
+            "DELETE FROM plan_layout_active_skipped_actions WHERE plan_id=? AND "
+            "relative_path IN (SELECT path FROM layout_skipped_changes WHERE action IS NULL)",
+            (plan_id,),
+        )
+        connection.execute(
+            "INSERT INTO plan_layout_active_skipped_actions(plan_id, relative_path, action) "
+            "SELECT ?, path, action FROM layout_skipped_changes WHERE action IS NOT NULL "
+            "ON CONFLICT(plan_id, relative_path) DO UPDATE SET action=excluded.action",
+            (plan_id,),
+        )
         cursor = connection.execute(
             "UPDATE plan_layout_state SET active_revision=?, content_empty=?, placed_entry_count=?, excluded_entry_count=?, placed_content_entry_count=?, total_placed_bytes=? WHERE plan_id=? AND active_revision=?",
             (
@@ -1367,6 +1526,9 @@ def apply_layout(
             "INSERT INTO plan_layout_acknowledgements VALUES(?,?,?,?)", acknowledgements
         )
         connection.commit()
+        persisted_progress.complete(
+            metrics={"changed_entry_count": int(result["changed_entry_count"])}
+        )
         if performance_metrics is not None:
             performance_metrics["sqlite_rows_written"] = (
                 connection.total_changes - initial_changes
@@ -1375,10 +1537,40 @@ def apply_layout(
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
+        if persisted_progress is not None:
+            try:
+                persisted_progress.fail("layout apply failed")
+            except sqlite3.Error:
+                pass
         raise
     finally:
         connection.close()
     return {"analysis_run": str(run_path), "revision": revision, **result}
+
+
+@run_workspace_refusal
+def apply_layout(
+    analysis_run: Any,
+    plan_id: str,
+    layout_path: Any,
+    acknowledge_exclusions: bool = False,
+    acknowledge_content_empty: bool = False,
+    *,
+    performance_metrics: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    run_path, _database_path = resolve_run_directory(analysis_run)
+    try:
+        with nonblocking_lock(run_path / ".filesystem-organizer.lock"):
+            return _apply_layout_locked(
+                analysis_run,
+                plan_id,
+                layout_path,
+                acknowledge_exclusions,
+                acknowledge_content_empty,
+                performance_metrics=performance_metrics,
+            )
+    except LinuxFilesystemError as error:
+        raise ConsolidationPlanError(str(error)) from error
 
 
 class Projection(NamedTuple):

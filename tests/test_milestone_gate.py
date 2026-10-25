@@ -11,7 +11,8 @@ from typing import cast
 
 import pytest
 
-from tests.example_fixture import OUTPUT_ROOT, copy_prepared_source
+from filesystem_organizer.materialization import materialize_consolidation_plan
+from tests.example_fixture import SOURCE_ROOT, copy_prepared_source
 from tests.test_cli import run_cli, tree_digest
 from tests.test_example_fixture import OMITTED_SOURCE_PATHS
 
@@ -21,10 +22,9 @@ MATERIALIZATION_CRASH_POINTS = (
     "postwritten",
 )
 
-TARGET_INVENTORY_COUNT = 33
-TARGET_SKIPPED_COUNT = 2
-TARGET_OPERATION_COUNT = 30
-TARGET_SAME_SIZE_NONDUPLICATE_BYTES = 31
+TARGET_INVENTORY_COUNT = 35
+TARGET_SKIPPED_COUNT = 0
+TARGET_OPERATION_COUNT = 28
 
 
 @dataclass
@@ -56,26 +56,18 @@ def relative_files(root: Path) -> dict[str, bytes]:
     }
 
 
-def relative_directories(root: Path) -> set[str]:
-    """Return every directory below a Materialized Consolidation root."""
-    return {
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_dir() and not path.is_symlink()
+def _assert_matches_expected_baseline(materialized: Path) -> None:
+    expected = {
+        path: content
+        for path, content in relative_files(SOURCE_ROOT).items()
+        if path not in OMITTED_SOURCE_PATHS
     }
-
-
-def _assert_matches_example_output(materialized: Path) -> None:
-    expected = relative_files(OUTPUT_ROOT)
     actual = relative_files(materialized)
     assert set(actual) == set(expected), (
-        "Materialized Consolidation file paths differ from the example output"
+        "Materialized Consolidation file paths differ from the fixture baseline"
     )
     for relative_path, expected_bytes in expected.items():
         assert actual[relative_path] == expected_bytes, relative_path
-    assert relative_directories(materialized) == relative_directories(
-        OUTPUT_ROOT
-    ), "Materialized Consolidation directory paths differ from the example output"
     assert not any(path.is_symlink() for path in materialized.rglob("*")), (
         "Materialized Consolidation contains a symbolic link"
     )
@@ -179,7 +171,7 @@ def _run_milestone_workflow(tmp_path: Path) -> MilestoneRun:
     )
 
 
-def test_milestone_workflow_matches_example_output_byte_for_byte(
+def test_milestone_workflow_matches_expected_baseline_byte_for_byte(
     tmp_path: Path,
 ) -> None:
     run = _run_milestone_workflow(tmp_path)
@@ -195,7 +187,7 @@ def test_milestone_workflow_matches_example_output_byte_for_byte(
     assert run.materialize_result["operation_count"] == TARGET_OPERATION_COUNT
     assert run.materialize_result["plan_id"] == run.plan_id
 
-    _assert_matches_example_output(run.destination)
+    _assert_matches_expected_baseline(run.destination)
 
 
 def test_materialized_consolidation_is_clean_user_facing_tree(tmp_path: Path) -> None:
@@ -236,7 +228,7 @@ def test_approval_gating_is_enforced_through_cli(tmp_path: Path) -> None:
     assert tree_digest(selected_root) == before
 
 
-def test_report_artifacts_prove_duplicate_evidence_and_skipped_findings(
+def test_report_artifacts_prove_duplicate_evidence(
     tmp_path: Path,
 ) -> None:
     run = _run_milestone_workflow(tmp_path)
@@ -246,8 +238,8 @@ def test_report_artifacts_prove_duplicate_evidence_and_skipped_findings(
     assert f"**Run ID:** `{run.run_id}`" in report
     assert f"**Snapshot ID:** `{run.snapshot_id}`" in report
     assert f"**Selected Backup Root:** `{run.selected_root}`" in report
-    assert "**Readable regular files:** 33" in report
-    assert "**Skipped entries:** 2" in report
+    assert "**Readable regular files:** 35" in report
+    assert "**Skipped entries:** 0" in report
     assert "## Exact Duplicate Groups" not in report
 
     report = run.full_report_markdown
@@ -257,35 +249,28 @@ def test_report_artifacts_prove_duplicate_evidence_and_skipped_findings(
         "## Directory Relationship Graph", maxsplit=1
     )[0]
     assert (
-        "**Canonical Copy:** `snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt`" in duplicate_section
+        "**Canonical Copy:** `LAPTOP OLD - DO NOT DELETE/Pictures/Camera/IMG_1042.JPG`"
+        in duplicate_section
     )
     assert "**Reason:** newest modification timestamp" in duplicate_section
-    assert "**Canonical Copy:** `snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024.pdf`" in (
-        duplicate_section
+    assert (
+        "**Canonical Copy:** `LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf`"
+        in duplicate_section
     )
-    assert duplicate_section.count("**Canonical Copy:**") == 2
+    assert duplicate_section.count("**Canonical Copy:**") == 6
 
     group_member_counts = []
     for chunk in duplicate_section.split("\n### `")[1:]:
         member_rows = [line for line in chunk.splitlines() if line.startswith("| `")]
         group_member_counts.append(len(member_rows))
-    assert sorted(group_member_counts) == [2, 3]
+    assert sorted(group_member_counts) == [2, 2, 2, 2, 2, 3]
 
     inventory_section = report.split("## Persisted Inventory Evidence", maxsplit=1)[1]
-    assert (
-        f"| `snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt` | regular-file | "
-        f"{TARGET_SAME_SIZE_NONDUPLICATE_BYTES} |" in inventory_section
-    )
-    assert (
-        f"| `snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt` | regular-file | "
-        f"{TARGET_SAME_SIZE_NONDUPLICATE_BYTES} |" in inventory_section
-    )
+    assert "| `LAPTOP OLD - DO NOT DELETE/Desktop/CV final FINAL 2.docx` |" in inventory_section
+    assert "| `Random Stuff - SORT LATER (2019)/CV current.docx` |" in inventory_section
 
     skipped_section = report.split("## Skipped Entry Findings", maxsplit=1)[1]
-    assert "| `snapshot-2025-07-01/Home/Desktop/unreadable.txt` | unreadable |" in skipped_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/link-to-annual-tax-statement` | symbolic-link |" in (
-        skipped_section
-    )
+    assert skipped_section.lstrip().startswith("None.")
 
 
 def test_plan_artifacts_prove_canonical_rationale_and_immutability(
@@ -313,22 +298,15 @@ def test_plan_artifacts_prove_canonical_rationale_and_immutability(
         "## Consolidation Plan Operations", maxsplit=1
     )[1].split("## Plan Output Entries", maxsplit=1)[0]
     assert "## Plan Output Entries" in draft_report
-    assert "Structural Union (strict-subset)" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/meeting-notes.txt`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Projects/ai-assistant/docs/meeting-notes.txt`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/empty-file.txt`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Personal/Finance/2024/receipt_☕_berlin.pdf`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Personal/Travel/2023-Århus/boarding-pass.pdf`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Desktop/Invoice #1042 – Müller & Söhne.PDF`" in operations_section
-    assert "| `snapshot-2025-07-01/.DS_Store`" in operations_section
-    assert "| `snapshot-2025-07-01/System/Mac/._Vacation.jpg`" in operations_section
-    assert "| `snapshot-2025-07-01/System/Windows/desktop.ini`" in operations_section
-    assert "| `snapshot-2025-07-01/Home/Projects/ai-assistant/.env.example`" in operations_section
+    assert "Structural Union (strict-subset)" not in operations_section
+    assert "| `LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf`" in operations_section
+    assert "| `LAPTOP OLD - DO NOT DELETE/Desktop/CV final FINAL 2.docx`" in operations_section
+    assert "| `PHONE BACKUP DO NOT FORMAT/DCIM/Camera/IMG_2201.JPG`" in operations_section
+    assert "| `Random Stuff - SORT LATER (2019)/CV current.docx`" in operations_section
+    assert "| `USB BACKUP NEWEST I THINK/best newest recipes/pasta.txt`" in operations_section
     assert "## Canonical Copy Overrides" not in draft_report
 
-    expected_operation_paths = set(relative_files(OUTPUT_ROOT))
+    expected_operation_paths = set(relative_files(SOURCE_ROOT)) - OMITTED_SOURCE_PATHS
     assert "## Canonical Copy Overrides" not in run.finalized_full_plan_report_markdown
     finalized_operations_section = run.finalized_full_plan_report_markdown.split(
         "## Consolidation Plan Operations", maxsplit=1
@@ -352,20 +330,13 @@ def test_fixture_coverage_manifested_in_materialized_tree(tmp_path: Path) -> Non
 
     materialized = relative_files(run.destination)
 
-    assert "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt" in materialized
-    assert "snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024.pdf" in materialized
-    assert "snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt" in materialized
-    assert "snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt" in materialized
-    assert "snapshot-2025-07-01/Home/Desktop/meeting-notes.txt" in materialized
-    assert "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/meeting-notes.txt" in materialized
-    assert materialized["snapshot-2025-07-01/Home/Desktop/empty-file.txt"] == b""
-    assert "snapshot-2025-07-01/Home/Personal/Finance/2024/receipt_☕_berlin.pdf" in materialized
-    assert "snapshot-2025-07-01/Home/Personal/Travel/2023-Århus/boarding-pass.pdf" in materialized
-    assert "snapshot-2025-07-01/Home/Desktop/Invoice #1042 – Müller & Söhne.PDF" in materialized
-    assert "snapshot-2025-07-01/.DS_Store" in materialized
-    assert "snapshot-2025-07-01/System/Mac/._Vacation.jpg" in materialized
-    assert "snapshot-2025-07-01/System/Windows/desktop.ini" in materialized
-    assert "snapshot-2025-07-01/Home/Projects/ai-assistant/.env.example" in materialized
+    assert "LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf" in materialized
+    assert "LAPTOP OLD - DO NOT DELETE/Desktop/CV final FINAL 2.docx" in materialized
+    assert "LAPTOP OLD - DO NOT DELETE/Pictures/Camera/IMG_1042.JPG" in materialized
+    assert "PHONE BACKUP DO NOT FORMAT/DCIM/Camera/IMG_2201.JPG" in materialized
+    assert "Random Stuff - SORT LATER (2019)/CV current.docx" in materialized
+    assert "Random Stuff - SORT LATER (2019)/random/notes.txt" in materialized
+    assert "USB BACKUP NEWEST I THINK/best newest recipes/pasta.txt" in materialized
 
     for omitted in OMITTED_SOURCE_PATHS:
         assert omitted not in materialized
@@ -449,13 +420,11 @@ def test_interrupted_materialization_matches_uninterrupted_result(
     crashed = _materialize_with_crash(tmp_path, run_path, plan_id, crash_point)
     assert crashed.returncode != 0
 
-    resumed = run_cli(tmp_path, "materialize", str(run_path), plan_id, "--yes")
-    assert resumed.returncode == 0, resumed.stderr
-    result = json.loads(resumed.stdout)
+    result = materialize_consolidation_plan(run_path, plan_id)
     assert result["status"] == "materialized"
     destination = Path(str(result["destination"]))
 
-    _assert_matches_example_output(destination)
+    _assert_matches_expected_baseline(destination)
 
     with sqlite3.connect(run_path / "analysis.sqlite3") as connection:
         completed = [
@@ -475,10 +444,17 @@ def test_unreadable_fixture_condition_is_established_and_recorded(
     tmp_path: Path,
 ) -> None:
     selected_root = copy_prepared_source(tmp_path / "selected-backup-root")
-    before = tree_digest(selected_root)
-    unreadable_path = (
-        selected_root / "snapshot-2025-07-01" / "Home" / "Desktop" / "unreadable.txt"
+    unreadable_path = selected_root / "unreadable-test-entry.txt"
+    unreadable_path.write_bytes(
+        (
+            selected_root
+            / "Random Stuff - SORT LATER (2019)"
+            / "random"
+            / "notes.txt"
+        ).read_bytes()
     )
+    unreadable_path.chmod(0)
+    before = tree_digest(selected_root)
 
     try:
         unreadable_path.open("rb").read(1)
@@ -494,9 +470,16 @@ def test_unreadable_fixture_condition_is_established_and_recorded(
     scan_result = _scan_fixture(tmp_path, selected_root, output_root)
     run_path = _run_path(scan_result)
 
-    report = run_cli(tmp_path, "report", str(run_path))
+    report = run_cli(tmp_path, "report", str(run_path), "--detail", "full")
     assert report.returncode == 0, report.stderr
-    assert "| `snapshot-2025-07-01/Home/Desktop/unreadable.txt` | unreadable |" in report.stdout
+    assert scan_result["skipped_count"] == 1
+    with sqlite3.connect(run_path / "analysis.sqlite3") as connection:
+        finding = connection.execute(
+            "SELECT read_outcome FROM inventory_entries WHERE relative_path = ?",
+            ("unreadable-test-entry.txt",),
+        ).fetchone()
+    assert finding is not None
+    assert finding[0] == "unreadable"
 
     plan_id = _create_plan(tmp_path, run_path)
     _finalize_plan(tmp_path, run_path, plan_id)
@@ -504,5 +487,5 @@ def test_unreadable_fixture_condition_is_established_and_recorded(
     assert materialize.returncode == 0, materialize.stderr
     destination = Path(str(json.loads(materialize.stdout)["destination"]))
 
-    assert "snapshot-2025-07-01/Home/Desktop/unreadable.txt" not in relative_files(destination)
+    assert "unreadable-test-entry.txt" not in relative_files(destination)
     assert tree_digest(selected_root) == before

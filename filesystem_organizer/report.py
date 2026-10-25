@@ -99,6 +99,30 @@ def _build_full_report(analysis_run: Path) -> StreamingDocument:
                 "Analysis Run uses unsupported clean-cutover evidence schema; "
                 f"create a new Analysis Run: {run_path}"
             )
+        execution_intent_row = connection.execute(
+            "SELECT * FROM analysis_run_execution_intent WHERE run_id=?",
+            (run["run_id"],),
+        ).fetchone()
+        intent_columns = {
+            str(column["name"])
+            for column in connection.execute(
+                "PRAGMA table_info(analysis_run_execution_intent)"
+            )
+        }
+        execution_intent = (
+            {
+                "execution_mode": execution_intent_row["execution_mode"],
+                "executor_kind": execution_intent_row["executor_kind"],
+                "executor_version": (
+                    execution_intent_row["executor_version"]
+                    if "executor_version" in intent_columns
+                    else 1
+                ),
+                "admission_version": execution_intent_row["admission_version"],
+            }
+            if execution_intent_row is not None
+            else None
+        )
         has_directory_evidence = (
             int(run["schema_version"]) >= DIRECTORY_EVIDENCE_SCHEMA_VERSION
         )
@@ -199,6 +223,14 @@ def _build_full_report(analysis_run: Path) -> StreamingDocument:
             f"**Snapshot ID:** `{run['snapshot_id']}`  ",
             f"**Selected Backup Root:** `{markdown_path(run['selected_backup_root'])}`  ",
             f"**Status:** {run['status']}  ",
+            (
+                "**Execution intent:** "
+                f"{execution_intent['execution_mode']} / "
+                f"{execution_intent['executor_kind']} v{execution_intent['executor_version']} "
+                f"(admission v{execution_intent['admission_version']})  "
+                if execution_intent is not None
+                else "**Execution intent:** legacy run (not recorded)  "
+            ),
             (
                 f"**Structural evidence version:** {DIRECTORY_EVIDENCE_VERSION}  "
                 if has_directory_evidence

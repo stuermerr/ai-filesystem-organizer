@@ -28,3 +28,6 @@ def test_moderate_subtree_and_root_wide_layout_edits() -> None:
             assert sample["total_entries"] == size
             assert sample["affected_entries"] >= sample["changed_entries"] > 0
             assert sample["sqlite_rows_written"] >= 2 * sample["changed_entries"]
+            # Compilation may page the baseline in bounded batches, but
+            # occupancy and persistence must not issue SQL per entry.
+            assert sample["sqlite_statements"] < 1_000

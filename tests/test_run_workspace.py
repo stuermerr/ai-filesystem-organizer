@@ -114,6 +114,7 @@ def _connection_with_plan_rows(tmp_path: Path) -> tuple[sqlite3.Connection, Path
           snapshot_id TEXT NOT NULL,
           schema_version INTEGER NOT NULL,
           selected_backup_root TEXT NOT NULL,
+          materialized_destination TEXT NOT NULL,
           status TEXT NOT NULL,
           started_at TEXT NOT NULL,
           completed_at TEXT,
@@ -134,7 +135,7 @@ def _connection_with_plan_rows(tmp_path: Path) -> tuple[sqlite3.Connection, Path
         """
     )
     connection.execute(
-        "INSERT INTO analysis_runs VALUES ('run-1', 'snap-1', ?, '/backup', "
+        "INSERT INTO analysis_runs VALUES ('run-1', 'snap-1', ?, '/backup', '/materialized', "
         "'complete', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', "
         "NULL, NULL, NULL)",
         (SCHEMA_VERSION,),

@@ -148,7 +148,9 @@ def hash_regular_file(
     )
 
 
-def digest_file(path: Path) -> tuple[int, str]:
+def digest_file(
+    path: Path, *, on_chunk: Callable[[bytes], None] | None = None
+) -> tuple[int, str]:
     """Hash a file's on-disk bytes independently of any in-memory write buffer.
 
     Raises OSError if the path cannot be opened or read; the caller decides
@@ -159,6 +161,8 @@ def digest_file(path: Path) -> tuple[int, str]:
 
     def _update(chunk: bytes) -> None:
         hasher.update(chunk)
+        if on_chunk is not None:
+            on_chunk(chunk)
 
     total, _ = stable_read(path, before, on_chunk=_update)
     return total, hasher.hexdigest()

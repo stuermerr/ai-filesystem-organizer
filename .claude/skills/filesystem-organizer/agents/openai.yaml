@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Filesystem Organizer"
+  short_description: "Agent-guided, deterministic filesystem consolidation"
+  default_prompt: "Use $filesystem-organizer to analyze or consolidate my stable filesystem collection safely."

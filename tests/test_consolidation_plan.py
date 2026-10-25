@@ -7,13 +7,53 @@ from pathlib import Path
 
 import pytest
 
+from filesystem_organizer.consolidation_plan.custom_layout import _path
 from tests.test_cli import run_cli, tree_digest
+
+
+def test_custom_layout_reserves_every_versioned_staging_prefix() -> None:
+    findings: list[dict[str, object]] = []
+
+    result = _path(
+        ".filesystem-organizer-staging-v1-plan/owned",
+        "output path",
+        findings,
+    )
+
+    assert result is None
+    assert [finding["code"] for finding in findings] == ["reserved-path"]
 
 
 def _write_shared_regions(root: Path) -> None:
     for region in ("shared-region-one", "shared-region-two"):
         (root / region).mkdir(parents=True, exist_ok=True)
         (root / region / "anchor.txt").write_text(f"shared evidence for {region}\n")
+
+
+def test_plan_derivation_loads_inventory_once_and_visits_only_ranges(
+    tmp_path: Path,
+) -> None:
+    from filesystem_organizer.consolidation_plan import create_consolidation_plan
+
+    selected_root = tmp_path / "backup"
+    for name in ("first", "second", "third"):
+        (selected_root / name).mkdir(parents=True)
+        (selected_root / name / "same.txt").write_text("same")
+        _write_shared_regions(selected_root / name)
+    scan = run_cli(tmp_path, "scan", str(selected_root))
+    assert scan.returncode == 0, scan.stderr
+    run_path = Path(json.loads(scan.stdout)["analysis_run"])
+    metrics: dict[str, int] = {}
+
+    result = create_consolidation_plan(run_path, performance_metrics=metrics)
+
+    assert result["status"] == "draft"
+    assert metrics["global_inventory_loads"] == 1
+    assert metrics["global_inventory_rows_loaded"] > 0
+    assert metrics["descendant_range_lookups"] > 0
+    assert metrics["descendant_visits"] < (
+        metrics["global_inventory_rows_loaded"] * metrics["descendant_range_lookups"]
+    )
 
 
 def test_plan_refuses_incomplete_analysis_run(tmp_path: Path) -> None:
@@ -142,7 +182,10 @@ def test_unreadable_files_do_not_strengthen_structural_evidence(
         assert plan.returncode == 0, plan.stderr
         plan_report = run_cli(tmp_path, "plan-report", run_path, "--detail", "full")
         assert plan_report.returncode == 0, plan_report.stderr
-        assert "**Participating Directory Trees:** `alpha`, `beta`" not in plan_report.stdout
+        assert (
+            "**Participating Directory Trees:** `alpha`, `beta`"
+            not in plan_report.stdout
+        )
     finally:
         for path in unreadable_paths:
             path.chmod(0o600)
@@ -1102,7 +1145,7 @@ def test_plan_and_plan_report_on_example_fixture(tmp_path: Path) -> None:
     assert plan_result["snapshot_id"] == scan_result["snapshot_id"]
     assert plan_result["schema_version"] == 9
     assert plan_result["plan_id"]
-    assert plan_result["operation_count"] == 30
+    assert plan_result["operation_count"] == 28
     expected_destination = str(
         output_root.resolve() / "materialized" / scan_result["run_id"]
     )
@@ -1139,52 +1182,36 @@ def test_plan_and_plan_report_on_example_fixture(tmp_path: Path) -> None:
     assert retained_paths == sorted(set(retained_paths))
     assert all(source == output for source, output, _ in operations)
 
-    excluded = {
-        "snapshot-2025-07-01/Home/Desktop/link-to-annual-tax-statement",
-        "snapshot-2025-07-01/Home/Desktop/unreadable.txt",
-    }
-    assert not excluded & set(retained_paths)
-    assert "snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt" in retained_paths
-    assert "snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt" in retained_paths
-    assert (
-        "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
-        in retained_paths
-    )
-    assert (
-        "snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024.pdf"
-        in retained_paths
-    )
+    assert "LAPTOP OLD - DO NOT DELETE/Desktop/CV final FINAL 2.docx" in retained_paths
+    assert "Random Stuff - SORT LATER (2019)/CV current.docx" in retained_paths
+    assert "LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf" in retained_paths
+    assert "LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt" in retained_paths
 
     reasons_by_path = {row[0]: row[2] for row in operations}
     assert (
-        reasons_by_path[
-            "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
-        ]
+        reasons_by_path["LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf"]
         == "newest modification timestamp"
     )
     assert (
-        reasons_by_path[
-            "snapshot-2025-07-01/Home/Desktop/annual_tax_statement_2024.pdf"
-        ]
+        reasons_by_path["LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt"]
         == "newest modification timestamp"
     )
     assert (
-        reasons_by_path["snapshot-2025-07-01/Home/Desktop/same-size-alpha.txt"] is None
+        reasons_by_path["LAPTOP OLD - DO NOT DELETE/Desktop/CV final FINAL 2.docx"]
+        == "unique-size metadata observation"
     )
     assert (
-        reasons_by_path["snapshot-2025-07-01/Home/Desktop/same-size-bravo.txt"] is None
+        reasons_by_path["Random Stuff - SORT LATER (2019)/CV current.docx"]
+        == "unique-size metadata observation"
     )
 
     plan_report = run_cli(tmp_path, "plan-report", str(run_path), "--detail", "full")
     assert plan_report.returncode == 0, plan_report.stderr
     assert f"**Plan ID:** `{plan_result['plan_id']}`" in plan_report.stdout
     assert f"**Run ID:** `{plan_result['run_id']}`" in plan_report.stdout
-    assert "**Operation Count:** 30" in plan_report.stdout
-    assert (
-        "| `snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt` | `snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt` |"
-        in (plan_report.stdout)
-    )
-    assert "Structural Union (strict-subset)" in plan_report.stdout
+    assert "**Operation Count:** 28" in plan_report.stdout
+    assert "LAPTOP OLD - DO NOT DELETE/Desktop/Tax 2023 FINAL.pdf" in plan_report.stdout
+    assert "Structural Union (strict-subset)" not in plan_report.stdout
 
     explicit_plan_report = run_cli(
         tmp_path,
@@ -1275,8 +1302,8 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
         tmp_path,
         "plan-override",
         str(run_path),
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt",
-        "operator prefers the project copy",
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt",
+        "operator prefers the USB copy",
         "--plan-id",
         plan_id,
     )
@@ -1284,13 +1311,13 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
     override_result = json.loads(override.stdout)
     assert override_result["plan_id"] == plan_id
     assert override_result["source_relative_path"] == (
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
     )
     assert (
         override_result["prior_relative_path"]
-        == "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+        == "LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt"
     )
-    assert override_result["reason"] == "operator prefers the project copy"
+    assert override_result["reason"] == "operator prefers the USB copy"
 
     database_path = run_path / analysis_run.DATABASE_NAME
     with sqlite3.connect(database_path) as connection:
@@ -1303,11 +1330,11 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
             ).fetchall()
         }
         assert (
-            "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+            "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
             in operations
         )
         assert (
-            "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+            "LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt"
             not in operations
         )
 
@@ -1316,14 +1343,14 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
             "WHERE plan_id = ? AND source_relative_path = ?",
             (
                 plan_id,
-                "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt",
+                "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt",
             ),
         ).fetchone()
         assert overridden_operation["output_relative_path"] == (
-            "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+            "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
         )
         assert (
-            "operator prefers the project copy"
+            "operator prefers the USB copy"
             in overridden_operation["canonical_reason"]
         )
 
@@ -1334,13 +1361,13 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
         ).fetchall()
         assert len(override_rows) == 1
         assert override_rows[0]["selected_relative_path"] == (
-            "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+            "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
         )
         assert (
             override_rows[0]["prior_relative_path"]
-            == "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+            == "LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt"
         )
-        assert override_rows[0]["reason"] == "operator prefers the project copy"
+        assert override_rows[0]["reason"] == "operator prefers the USB copy"
 
     plan_report = run_cli(
         tmp_path, "plan-report", str(run_path), "--plan-id", plan_id, "--detail", "full"
@@ -1348,7 +1375,7 @@ def test_plan_override_replaces_canonical_choice_while_draft(tmp_path: Path) -> 
     assert plan_report.returncode == 0, plan_report.stderr
     assert "## Canonical Copy Overrides" in plan_report.stdout
     assert (
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
         in plan_report.stdout
     )
 
@@ -1361,7 +1388,7 @@ def test_plan_override_rejects_invalid_group_member(tmp_path: Path) -> None:
         tmp_path,
         "plan-override",
         str(run_path),
-        "snapshot-2025-07-01/Home/Desktop/meeting-notes.txt",
+        "Random Stuff - SORT LATER (2019)/random/notes.txt",
         "trying to override a unique file",
         "--plan-id",
         plan_id,
@@ -1390,7 +1417,7 @@ def test_plan_override_rejects_missing_reason(tmp_path: Path) -> None:
         tmp_path,
         "plan-override",
         str(run_path),
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt",
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt",
         "   ",
         "--plan-id",
         plan_id,
@@ -1433,7 +1460,7 @@ def test_plan_finalize_freezes_plan_and_rejects_further_changes(tmp_path: Path) 
         tmp_path,
         "plan-override",
         str(run_path),
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt",
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt",
         "too late, already finalized",
         "--plan-id",
         plan_id,
@@ -1497,8 +1524,8 @@ def test_changing_choice_after_finalization_requires_new_plan(tmp_path: Path) ->
         tmp_path,
         "plan-override",
         str(run_path),
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt",
-        "want the project copy in the new plan",
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt",
+        "want the USB copy in the new plan",
         "--plan-id",
         second_plan_id,
     )
@@ -1527,10 +1554,10 @@ def test_changing_choice_after_finalization_requires_new_plan(tmp_path: Path) ->
     assert first_plan_status == "finalized"
     assert first_plan_operations_after == first_plan_operations_before
     assert (
-        "snapshot-2025-07-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+        "USB BACKUP NEWEST I THINK/best newest recipes/banana-bread.txt"
         in second_plan_operations
     )
     assert (
-        "snapshot-2023-11-01/Home/Projects/ai-assistant/docs/recovery-checklist.txt"
+        "LAPTOP OLD - DO NOT DELETE/Recipes/banana-bread.txt"
         not in second_plan_operations
     )

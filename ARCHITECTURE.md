@@ -1,14 +1,26 @@
-# Custom Layout Architecture
+# AI Filesystem Organizer: Custom Layout Architecture
 
 ## Purpose
 
-Add user-designed directory layouts without making the agent or materializer interpret informal instructions. A deterministic Custom Layout module compiles compact rules against an immutable Baseline Projection, persists revisioned results, and exposes the same finalized Plan Projection seam already consumed by materialization.
+AI Filesystem Organizer places an agent-guided planning layer over a
+deterministic filesystem engine. Repository Agent Skills turn user intent into
+public CLI operations; they never become an execution authority. The Custom
+Layout module compiles compact rules against an immutable Baseline Projection,
+persists revisioned results, and exposes the finalized Plan Projection seam
+consumed by materialization.
 
-The existing Analysis Run remains immutable evidence; only draft-plan state changes during layout design.
+This architecture implements [CONCEPT.md](CONCEPT.md). The existing Analysis Run remains immutable evidence; only draft-plan state changes during layout design.
+
+Before Analysis Run content work, the CLI applies fail-closed workspace and destination admission layers. `scan-admission` separately probes the effective Run Workspace Root for directory creation, filesystem type, per-file capacity, free capacity, and SQLite WAL, and probes the Materialized Destination for publication capability. Run Workspace Root defaults to Run Output Root; `--workspace-root WORKSPACE` moves the complete CLI-owned run to `WORKSPACE/runs/RUN_ID` without changing destination derivation. Every `scan` allocates its Analysis Run ID before admission and resolves one exact Materialized Consolidation destination: an explicit `--destination`, or `RUN_OUTPUT_ROOT/materialized/RUN_ID`.
+
+`scan` then builds one payload-free metadata inventory and reuses it for two independent gates before hashing. Metadata Admission checks only destination facts and refuses source files beyond the destination's reported file-size capability or capacity that cannot fit even under best-case exact deduplication. Run Workspace capacity admission uses the structural analyzer's same successful-directory ancestor semantics to calculate the exact projected `structural_shared_descendants` row count. It estimates the final SQLite database from schema/index text payload, metadata-derived path sizes, the measured 1,000-byte-per-row large-corpus floor, and a 20% single-file safety margin; estimated peak capacity includes both database and WAL plus auxiliary state. Filesystem limits and free bytes are facts, while projected byte sizes are explicitly estimates. The smallest refusal policy is capacity-based rather than a filesystem allowlist, so small vfat runs remain supported. The resolved destination is persisted with the Analysis Run so Plan creation, preflight, and materialization share it. Content hashing and structural analysis begin only after both gates pass; finalized-plan preflight remains authoritative for exact operations, bytes, names, source revalidation, and recovery.
 
 ## Architectural shape
 
 ```text
+User intent ──> Agent Skills ──> public CLI commands
+                                  │
+                                  ▼
 Analysis Run evidence
         │
         ▼
@@ -65,7 +77,9 @@ Canonical Copy overrides update only the selected proven source occurrence for a
 
 ### Custom Layout module
 
-Create an internal `filesystem_organizer.consolidation_plan.custom_layout` module. Its public interface is the three layout operations above; parsing, indexing, compilation, validation, and persistence remain internal seams.
+The internal `filesystem_organizer.consolidation_plan.custom_layout` module
+exposes the three layout operations above; parsing, indexing, compilation,
+validation, and persistence remain internal seams.
 
 The module performs four jobs:
 
@@ -78,7 +92,7 @@ Validation returns results and does not mutate plan state. Application never tru
 
 ### Finalized projection loader
 
-Introduce one internal materialization-facing interface:
+The internal materialization-facing interface is:
 
 ```python
 load_finalized_execution_plan(
@@ -103,7 +117,7 @@ The materializer never reads `layout.json`, applies Layout Rules, resolves prece
 
 ### Reporting
 
-Extend the existing plan reporter rather than adding another reporting command:
+The existing plan reporter exposes the bounded layout view:
 
 ```console
 filesystem-organizer plan-report RUN --plan-id PLAN_ID \
@@ -163,9 +177,11 @@ Every export carries `plan_id` and `base_revision`. Application rejects a differ
 
 ## Persistence model
 
-Bump the Consolidation Plan schema version. Existing Analysis Run evidence does not require a rescan, but an older plan must be redrafted under the new plan schema before custom-layout use.
+The current Consolidation Plan schema supports Custom Layout state. Older
+Analysis Run evidence does not require a rescan, but an older plan must be
+redrafted under the current plan schema before custom-layout use.
 
-Use normalized tables with foreign keys rather than treating JSON as executable state:
+Normalized tables with foreign keys—not exported JSON—hold executable state:
 
 - `plan_baseline_entries`: immutable entry identity, baseline path, kind, content identity, and generated reason;
 - `plan_source_selections`: current draft Canonical Source Selection keyed by stable entry identity;
@@ -181,9 +197,13 @@ Use normalized tables with foreign keys rather than treating JSON as executable 
 
 The Consolidation Plan row stores the active draft revision and finalized revision. Revision zero represents the generated Baseline Projection with preserve-unmatched behavior. Successful application inserts a complete new revision and advances the active pointer in one transaction; prior revisions remain immutable. Finalization validates and snapshots only the active revision.
 
-Do not keep a second mutable copy of the active executable paths in `plan_operations`. That would create competing truths. Compatibility queries should route through the finalized projection loader or a read-only database view.
+The architecture does not keep a second mutable copy of the active executable
+paths in `plan_operations`; that would create competing truths. Compatibility
+queries route through the finalized projection loader or a read-only database
+view.
 
-The premature `plan-remap` function and `plan_path_remaps` table are superseded by this model and should be removed before implementation begins.
+The earlier `plan-remap` function and `plan_path_remaps` table are superseded
+and are not part of the current model.
 
 ## Compilation and validation
 
@@ -229,6 +249,31 @@ Custom output names may be invented rather than inherited from the source. Prefl
 
 The existing materializer retains final authority: it continues no-overwrite publication, source/content revalidation, destination refusal, journal admission, reconciliation, and final manifest verification.
 
+### Source-preserving durability and recovery
+
+Source-preserving materialization writes an owned staging tree and confirms work
+in bounded batches. A retained destination-filesystem descriptor is opened before
+staging writes. Each checkpoint synchronizes that filesystem before committing
+the batch's Execution Evidence, preserving Linux writeback-error reporting and
+ensuring copied work is never reported as durable ahead of its barrier. File,
+byte, and adaptive elapsed-time limits are evaluated between completed files;
+one active file can exceed a limit.
+
+Native-clone rejection is cached only within a Materialization Attempt and at a
+source/destination device-pair scope supported by repeated regular-file evidence.
+Nested mounts are observed per file, and permission, space, cross-device, and I/O
+failures do not become negative capability entries.
+
+Recovery retains the confirmed-prefix contract. Ownership, exact structure, and
+current source and staged bytes are independently revalidated before reuse.
+Ordinary mutable-file metadata, root identity, locking, prior durability, and a
+persisted digest do not prove current bytes, so supported filesystems use full
+stable reads on both sides. The result telemetry reports those logical reads
+separately from remaining-copy reads and distinguishes copied from durably
+confirmed files and bytes, checkpoint time, publication time, and execution
+phase. Terminal progress renders the same phases while stdout remains
+machine-readable.
+
 ## Materialization data flow
 
 ### Separate destination
@@ -237,41 +282,74 @@ The existing materializer retains final authority: it continues no-overwrite pub
 2. The execution manifest records placed files/directories and finalized projection fingerprint.
 3. Materialization copies only Placements and creates explicit directories.
 4. User Exclusions and Skipped Entry Findings remain absent from the result and are reported; the Selected Backup Root remains unchanged.
-5. Repeated execution reconciles against the same immutable manifest.
+5. Before terminal cleanup, interrupted execution reconciles against the same
+   immutable manifest.
+6. After durable `COMPLETE`, a terminal run with no failed, recoverable, or
+   unmaterialized plan state is summarized in `completion.json`; the large
+   SQLite workspace is removed under the persistent Run Workspace lock. The
+   final output and persistent run/destination lock sidecars remain untouched.
 
 ### In-place
 
-Reuse the existing forward-resumable journal and hard-link protection protocol. Extend the execution manifest with disposition and stable entry identity; do not add rollback.
+An in-place executor seam binds a persisted executor kind and internal version
+to one immutable execution context. Shared Plan semantics, locks, approvals,
+attempts, progress, and evidence remain outside its adapters. Executor
+Admission proves real capabilities on the Selected Backup Root: it prefers
+HardLinkProtection where hard links are available and otherwise admits the
+current RenameProtection implementation only when strict same-filesystem
+no-replace rename, synchronization, locking, and cleanup probes all succeed.
+Selection is never inferred from a filesystem name and is not exposed as a
+user-selectable performance mode.
 
-Execution phases are:
+Both executor families revalidate the finalized plan and affected source
+metadata, apply only the frozen Plan Projection, preserve explicit skipped-entry
+outcomes, fail closed on unexplained occupants or ownership, and recover
+forward rather than rolling back.
 
-1. Revalidate the finalized plan, Structural Snapshot, every placed source, every proven occurrence of excluded content, and the current lstat evidence for affected skipped entries.
-2. Durably protect every placed source and every proven occurrence scheduled for exclusion using same-filesystem hard links.
-3. Publish and verify all Placements using the existing reconciliation rules.
-4. Remove noncanonical proven duplicate occurrences and explicitly excluded proven occurrences only while their protection remains durable.
-5. For an acknowledged Unverified Exclusion, move the filesystem entry into plan-owned staging without following or interpreting it, journal the transition, and refuse safely if the move cannot be performed.
-6. Leave every acknowledged Unmanaged Retention unchanged at its original path and verify that fact for reporting.
-7. Verify the complete placed output and mode-specific qualifications, durably record materialization completion, then remove all plan-owned protection. Return success only after cleanup is complete.
+HardLinkProtection creates owned same-filesystem protection names before
+destructive namespace work. It publishes and verifies Placements while the
+protected names remain available, then removes duplicate and explicitly
+excluded occurrences only within the approved plan. Protection is removed only
+after terminal completion is durable.
 
-A power loss before terminal completion leaves sufficient staged state to resume the exact plan forward. A power loss after the completion event but before cleanup resumes cleanup idempotently. After a successful return, no recovery copy of a User Exclusion remains.
+RenameProtection reconstructs a deterministic operation schedule from the
+finalized Plan. An ordinary Placement is a strict no-replace rename with sparse
+persisted checkpoints and failure evidence rather than one database row per
+operation. A secret-bound temporary pivot is introduced only for a proven
+namespace cycle or a payload trapped below a directory it must replace; pivot
+intent and phase are persisted before its temporary pathname is used. Recovery
+reconciles source, pivot, and final observations with the schedule. Ambiguous
+ownership, unexplained double presence, total absence, or occupied output names
+move the attempt to needs-attention instead of guessing.
 
-Excluding one baseline file identity removes every proven source occurrence represented by that identity during in-place execution. This preserves result-focused semantics rather than leaving noncanonical paths behind.
+Materialization results expose executor-independent telemetry under
+`executor_metrics`. Executor kind and version remain separate diagnostic facts
+for recovery and engineering support.
+
+After successful in-place completion, no recovery copy of a User Exclusion
+remains. Excluding one baseline file identity removes every proven source
+occurrence represented by that identity, while an acknowledged Unmanaged
+Retention remains unchanged and visibly qualified.
+
+VFAT is supported only after the real capability probes succeed and remains a
+non-journaled filesystem. Writeback barriers and forward recovery do not create
+a multi-directory transaction or immunity to power loss, metadata corruption,
+media failure, or manual deletion of an owned temporary name.
 
 ## Approval boundaries
 
-Layout acknowledgement and materialization approval remain distinct authorities:
+The human workflow has two approval authorities:
 
-- applying a revision with exclusions requires `--acknowledge-exclusions`;
-- exact skipped-finding outcomes are supplied as finding-bound acknowledgement arguments and persisted with that revision;
-- a Content-Empty Result requires a distinct acknowledgement before apply/finalize;
-- after finalization, current materialization preflight precedes the existing exact plan-and-destination approval;
-- a Content-Empty Result is the sole two-approval exception: one approval binds the content-empty revision, and a later approval binds execution after preflight.
+- **Final Plan Approval** binds the displayed Layout Revision, including User Exclusions, exact skipped-finding outcomes, and any Content-Empty Result. Semantic choices needed to construct that revision are decisions, not additional approval authorities. Backend layout acknowledgement flags carry already-stated semantic intent and do not create conversational gates.
+- **Materialization Approval** binds the current finalized Plan, destination, and mode after validation and preflight. Source-preserving headless execution maps it to `--yes`; in-place headless execution maps it to the single explicit `--acknowledge-destructive` confirmation.
 
-The skill specifies the required facts and authority but does not prescribe canned user-facing wording.
+A semantic change invalidates Final Plan Approval. After Materialization Approval, the CLI repeats its checks and performs safe fallbacks, recovery, staging, and publication without further approval; every safety blocker still fails closed.
+
+The skills specify the required summaries and the two approval questions.
 
 ## CLI contract
 
-Add:
+The public CLI exposes:
 
 ```console
 filesystem-organizer plan-layout-export RUN PLAN_ID --output layout.json

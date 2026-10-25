@@ -1,0 +1,9 @@
+# Privacy boundary
+
+Scanning, hashing, relationship analysis, Exact Duplicate and content-identity determination, planning, and filesystem copying are local CLI operations. Exact Duplicate and content identity come only from local CLI evidence, never from agent-side file-content inspection.
+
+The coding agent primarily uses filesystem metadata and structural evidence. Agent-visible evidence may enter the agent provider's model context, including paths, filenames, timestamps, sizes, provenance patterns, CLI-provided Exact Duplicate or content-identity evidence, Canonical Copy reasons, Structural Relationship evidence, and Skipped Entry Findings. Selective agent-side inspection or batch extraction of relevant file contents is optional, adaptive evidence used only when it is likely to improve semantic structural recommendations. It may not occur. When it does, inspected or extracted contents may likewise enter the model context.
+
+Present this as an informational disclosure, not a required privacy choice, and do not promise that content inspection will happen. The user may opt into metadata-only behavior for the current workflow with wording such as `don't inspect file contents`. Treat that preference as sticky for the current workflow: do not ask again, and do not inspect contents during later recommendation or revision cycles. This project does not provide a separate local-only agent mode.
+
+Make this disclosure before the first CLI command and before any file-content inspection or extraction, whichever would happen first. It is a hard precondition for `source-probe`, `scan-admission`, `scan`, and every other CLI command, including while the mode is still ambiguous. Do not request approval for each selected file. Never claim that agent-visible evidence remains only on the local machine.
